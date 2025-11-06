@@ -1,5 +1,6 @@
 #include "UITask.h"
 #include <helpers/TxtDataHelpers.h>
+#include <helpers/BaseChatMesh.h>
 #include "../MyMesh.h"
 #include "target.h"
 
@@ -352,6 +353,13 @@ public:
   }
 
   bool handleInput(char c) override {
+  
+     
+     if (c == KEY_ENTER && _page == HomePage::FIRST) {
+      _task->gotoComposeScreen();
+      return true;
+    }
+    
     if (c == KEY_LEFT || c == KEY_PREV) {
       _page = (_page + HomePage::Count - 1) % HomePage::Count;
       return true;
@@ -496,6 +504,131 @@ public:
   }
 };
 
+// ----------------- Compose Screen (drop-in) -----------------
+class ComposeScreen : public UIScreen {
+  UITask* _task;
+  static constexpr int MAX_LEN = 240;
+  char _buf[MAX_LEN + 1];
+  int  _len = 0;
+  int  _cursor = 0;
+  unsigned long _sent_popup_until = 0;
+  bool _dirty = true;
+
+  void insertChar(char ch) {
+    if (_len >= MAX_LEN) return;
+    // shift right from cursor
+    for (int i = _len; i >= _cursor; --i) _buf[i + 1] = _buf[i];
+    _buf[_cursor] = ch;
+    _len++; _cursor++;
+    _dirty = true;
+  }
+
+  void backspace() {
+    if (_cursor <= 0) return;
+    // shift left over cursor-1
+    for (int i = _cursor - 1; i < _len; ++i) _buf[i] = _buf[i + 1];
+    _cursor--; _len--;
+    _dirty = true;
+  }
+
+  void moveLeft()  { if (_cursor > 0)    { _cursor--; _dirty = true; } }
+  void moveRight() { if (_cursor < _len) { _cursor++; _dirty = true; } }
+
+public:
+  ComposeScreen(UITask* task) : _task(task) { _buf[0] = '\0'; }
+
+  int render(DisplayDriver& display) override {
+    display.setColor(DisplayDriver::GREEN);
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.print("Compose");
+
+    // Counter
+    char cnt[16];
+    sprintf(cnt, "%d/%d", _len, MAX_LEN);
+    display.setCursor(display.width() - display.getTextWidth(cnt) - 1, 0);
+    display.print(cnt);
+
+    // Divider
+    display.drawRect(0, 10, display.width(), 1);
+
+    // Text area
+    display.setColor(DisplayDriver::LIGHT);
+    display.setCursor(0, 14);
+    char show[MAX_LEN + 1];
+    memcpy(show, _buf, _len);
+    show[_len] = 0;
+    display.printWordWrap(show, display.width());
+
+    // Footer help
+    display.setColor(DisplayDriver::YELLOW);
+    display.setCursor(0, display.height() - 10);
+    display.print("Enter=Send  Prev=Back  \x1A\x1B=Move  BKSP=Delete");
+
+    // Sent popup
+    if (millis() < _sent_popup_until) {
+      display.setColor(DisplayDriver::DARK);
+      int p = display.height() / 32;
+      int y = display.height() / 3;
+      display.fillRect(p, y, display.width() - 2 * p, y);
+      display.setColor(DisplayDriver::LIGHT);
+      display.drawRect(p, y, display.width() - 2 * p, y);
+      display.drawTextCentered(display.width() / 2, y + p * 3, "Sent!");
+      return 600;  // refresh during popup
+    }
+
+#if AUTO_OFF_MILLIS==0
+    return 2000;
+#else
+    return _dirty ? 100 : 1500;
+#endif
+  }
+
+  bool handleInput(char c) override {
+    // Navigation keys
+    if (c == KEY_LEFT)  { moveLeft();  return true; }
+    if (c == KEY_RIGHT) { moveRight(); return true; }
+
+    // Back/escape to home
+    if (c == KEY_PREV) {
+      _task->gotoHomeScreen();
+      return true;
+    }
+
+    // Send on Enter
+    if (c == KEY_ENTER) {
+      if (_len > 0) {
+        if (_task->sendText(_buf)) {
+          _sent_popup_until = millis() + 800;
+          _len = 0; _cursor = 0; _buf[0] = '\0';
+          _dirty = true;
+          _task->notify(UIEventType::ack);
+          _task->showAlert("Message sent", 800);
+        } else {
+          _task->showAlert("Send failed", 1000);
+        }
+      } else {
+        _task->showAlert("Empty", 500);
+      }
+      return true;
+    }
+
+    // Backspace
+    if (c == '\b') { backspace(); return true; }
+
+    // Printable ASCII
+    if (c >= 32 && c <= 126) { insertChar(c); return true; }
+
+    return false;
+  }
+};
+// --------------- end Compose Screen -----------------
+
+
+
+void UITask::gotoComposeScreen() { setCurrScreen(compose); }
+
+
 void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* node_prefs) {
   _display = display;
   _sensors = sensors;
@@ -527,6 +660,7 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
   splash = new SplashScreen(this);
   home = new HomeScreen(this, &rtc_clock, sensors, node_prefs);
   msg_preview = new MsgPreviewScreen(this, &rtc_clock);
+  compose    = new ComposeScreen(this);  
   setCurrScreen(splash);
 
  #ifdef USE_CARDKB
@@ -653,6 +787,10 @@ bool UITask::isButtonPressed() const {
 }
 
 void UITask::loop() {
+
+  static bool once = false;
+//if (!once) { showAlert("LOOP!", 800); once = true; }
+
   char c = 0;
 #if defined(PIN_USER_BTN)
   int ev = user_btn.check();
@@ -701,13 +839,30 @@ void UITask::loop() {
 #endif
 
 #ifdef USE_CARDKB
+ //original
   if (c == 0) {
     char kc = pollCardKB();
     if (kc) {
       // Keep the exact same UX as button presses: wake/extend display via checkDisplayOn
+      //char dbg[16]; sprintf(dbg, "kc:%02X", (uint8_t)kc);
+      //showAlert(dbg, 200);
+      
       c = checkDisplayOn(kc);
     }
   }
+  /*
+  // Always poll CardKB; only consume if we don't already have an input
+  char kc2 = pollCardKB();
+  if (kc2) {
+    // show what is actually heading into the UI (raw UI code, not I2C byte)
+    char dbg[16]; sprintf(dbg, "kc:%02X", (uint8_t)kc2);
+    showAlert(dbg, 200);
+
+    if (c == 0) {
+      c = checkDisplayOn(kc2); // will consume if it just woke the display
+    }
+  }
+  */
 #endif
 
   if (c != 0 && curr) {
@@ -836,6 +991,69 @@ void UITask::toggleGPS() {
   }
 }
 
+bool UITask::sendText(const char* text) {
+  if (!text || !*text) {
+    showAlert("Empty message", 800);
+    return false;
+  }
+
+  // Length guard (match your compose limit)
+  size_t msg_len = strnlen(text, 240);
+  if (msg_len > MAX_TEXT_LEN) {
+    showAlert("Message too long", 800);
+    return false;
+  }
+
+  // Try approach 1: Send to a known contact
+  AdvertPath recent[1];
+  int n = the_mesh.getRecentlyHeard(recent, 1);
+
+  if (n > 0 && recent[0].path_len > 0) {
+    // Try 6-byte prefix first (companion radio uses 6 bytes)
+    ContactInfo* contact = the_mesh.lookupContactByPubKey(recent[0].pubkey_prefix, 6);
+    
+    if (contact) {
+      uint32_t expected_ack, est_timeout;
+      uint32_t timestamp = rtc_clock.getCurrentTime();
+      int result = the_mesh.sendMessage(*contact, timestamp, 0, text, expected_ack, est_timeout);
+      
+      if (result == MSG_SEND_SENT_FLOOD) {
+        showAlert("Sent (flood)", 800);
+        notify(UIEventType::ack);
+        return true;
+      } else if (result == MSG_SEND_SENT_DIRECT) {
+        showAlert("Sent (direct)", 800);
+        notify(UIEventType::ack);
+        return true;
+      }
+    }
+  }
+
+  // Approach 2: Try sending to a public group channel if one exists
+  ChannelDetails channel;
+  if (the_mesh.getChannel(0, channel)) {
+    uint32_t timestamp = rtc_clock.getCurrentTime();
+    if (the_mesh.sendGroupMessage(timestamp, channel.channel, the_mesh.getNodeName(), text, msg_len)) {
+      showAlert("Sent to group", 800);
+      notify(UIEventType::ack);
+      return true;
+    }
+  }
+
+  // If all else fails, show the specific error
+  if (n == 0) {
+    showAlert("No recent nodes", 800);
+  } else if (recent[0].path_len == 0) {
+    showAlert("No valid path", 800);
+  } else {
+    showAlert("Contact not found", 800);
+  }
+  
+  return false;
+}
+
+
+
 void UITask::toggleBuzzer() {
     // Toggle buzzer quiet mode
   #ifdef PIN_BUZZER
@@ -911,6 +1129,17 @@ char UITask::pollCardKB() {
 }
 */
 
+/*
+  if (b != 0) {
+  static uint32_t last_dbg = 0;
+  uint32_t now = millis();
+  if (now - last_dbg > 150) { // rate limit
+    char dbg[16]; sprintf(dbg, "K:%02X", b);
+    showAlert(dbg, 120);
+    last_dbg = now;
+  }
+}
+*/
 
   if (b == 0) return 0;
 

@@ -60,6 +60,7 @@ private:
   UIScreen* splash;
   UIScreen* home;
   UIScreen* msg_preview;
+  UIScreen* compose; 
   UIScreen* curr;
 
   void userLedHandler();
@@ -90,7 +91,9 @@ public:
   void toggleBuzzer();
   void toggleGPS();
 
-
+  void gotoComposeScreen();
+  bool sendText(const char* text); // returns true if sent OK
+  
   // from AbstractUITask
   void msgRead(int msgcount) override;
   void newMsg(uint8_t path_len, const char* from_name, const char* text, int msgcount) override;
