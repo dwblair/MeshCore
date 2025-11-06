@@ -513,6 +513,22 @@ class ComposeScreen : public UIScreen {
   int  _cursor = 0;
   unsigned long _sent_popup_until = 0;
   bool _dirty = true;
+  
+  // Recipient selection
+  enum RecipientType {
+    RECIPIENT_CONTACT,
+    RECIPIENT_CHANNEL,
+    RECIPIENT_BROADCAST
+  };
+  RecipientType _recipient_type = RECIPIENT_CHANNEL;
+  int _recipient_index = 0;
+  
+  // Recent message senders (separate from just heard adverts)
+  struct RecentSender {
+    char name[32];
+    uint8_t pubkey_prefix[7];
+    uint32_t last_msg_time;
+  };
 
   void insertChar(char ch) {
     if (_len >= MAX_LEN) return;
@@ -534,18 +550,298 @@ class ComposeScreen : public UIScreen {
   void moveLeft()  { if (_cursor > 0)    { _cursor--; _dirty = true; } }
   void moveRight() { if (_cursor < _len) { _cursor++; _dirty = true; } }
 
+  void updateRecipientList() {
+    // Get recently heard adverts
+    _num_recent_contacts = the_mesh.getRecentlyHeard(_recent_contacts, UI_RECENT_LIST_SIZE);
+    
+    // Filter out any entries with all-zero pubkeys (invalid/empty entries)
+    int valid_contacts = 0;
+    for (int i = 0; i < _num_recent_contacts; i++) {
+      bool is_valid = false;
+      for (int j = 0; j < 7; j++) {
+        if (_recent_contacts[i].pubkey_prefix[j] != 0) {
+          is_valid = true;
+          break;
+        }
+      }
+      if (is_valid) {
+        if (valid_contacts != i) {
+          _recent_contacts[valid_contacts] = _recent_contacts[i];
+        }
+        valid_contacts++;
+      }
+    }
+    _num_recent_contacts = valid_contacts;
+    
+    // Also add established mesh contacts (not just heard adverts)
+    ContactInfo contact;
+    int space_left = UI_RECENT_LIST_SIZE - _num_recent_contacts;
+    
+    for (int i = 0; i < the_mesh.getNumContacts() && space_left > 0; i++) {
+      if (the_mesh.getContactByIdx(i, contact)) {
+        // Check if this contact has a valid pubkey
+        bool has_valid_pubkey = false;
+        for (int k = 0; k < 7; k++) {
+          if (contact.id.pub_key[k] != 0) {
+            has_valid_pubkey = true;
+            break;
+          }
+        }
+        
+        if (!has_valid_pubkey) continue; // Skip contacts with invalid pubkeys
+        
+        // Check if this contact is already in recent_contacts
+        bool already_added = false;
+        for (int j = 0; j < _num_recent_contacts; j++) {
+          if (memcmp(_recent_contacts[j].pubkey_prefix, contact.id.pub_key, 7) == 0) {
+            already_added = true;
+            break;
+          }
+        }
+        
+        if (!already_added) {
+          // Add this contact to the list
+          AdvertPath* new_contact = &_recent_contacts[_num_recent_contacts];
+          memcpy(new_contact->pubkey_prefix, contact.id.pub_key, 7);
+          new_contact->path_len = contact.out_path_len > 0 ? contact.out_path_len : 0;
+          if (contact.out_path_len > 0 && contact.out_path_len <= MAX_PATH_SIZE) {
+            memcpy(new_contact->path, contact.out_path, contact.out_path_len);
+          }
+          new_contact->recv_timestamp = rtc_clock.getCurrentTime(); // Current time
+          
+          // Use contact name if available, otherwise it will show as hex ID
+          if (contact.name[0]) {
+            strncpy(new_contact->name, contact.name, sizeof(new_contact->name) - 1);
+            new_contact->name[sizeof(new_contact->name) - 1] = 0;
+          } else {
+            new_contact->name[0] = 0; // Will show as hex ID
+          }
+          
+          _num_recent_contacts++;
+          space_left--;
+        }
+      }
+    }
+    
+    // Ensure we have at least the default public channel
+    bool found_public = false;
+    for (int i = 0; i < 8; i++) { // Check first 8 channels
+      ChannelDetails channel;
+      if (the_mesh.getChannel(i, channel)) {
+        if (strcmp(channel.name, "Public") == 0) {
+          found_public = true;
+          break;
+        }
+      } else {
+        break; // No more channels
+      }
+    }
+    
+    if (!found_public) {
+      // Add the default public channel
+      the_mesh.addChannel("Public", "izOH6cXN6mrJ5e26oRXNcg==");
+    }
+    
+    // Set default recipient to Public channel (channel 0)
+    _recipient_type = RECIPIENT_CHANNEL;
+    _recipient_index = 0;
+    
+    _dirty = true;
+  }
+
+  void nextRecipient() {
+    if (_recipient_type == RECIPIENT_CONTACT) {
+      _recipient_index++;
+      // First check recent senders, then recent contacts
+      int total_contacts = _num_recent_senders + _num_recent_contacts;
+      if (_recipient_index >= total_contacts || total_contacts == 0) {
+        _recipient_type = RECIPIENT_CHANNEL;
+        _recipient_index = 0;
+      }
+    } else if (_recipient_type == RECIPIENT_CHANNEL) {
+      _recipient_index++;
+      ChannelDetails channel;
+      if (!the_mesh.getChannel(_recipient_index, channel)) {
+        _recipient_type = RECIPIENT_BROADCAST;
+        _recipient_index = 0;
+      }
+    } else { // RECIPIENT_BROADCAST
+      _recipient_type = RECIPIENT_CONTACT;
+      _recipient_index = 0;
+      // If no contacts, skip directly to channels
+      if (_num_recent_senders == 0 && _num_recent_contacts == 0) {
+        _recipient_type = RECIPIENT_CHANNEL;
+      }
+    }
+    _dirty = true;
+  }
+
+  void prevRecipient() {
+    if (_recipient_type == RECIPIENT_CONTACT) {
+      if (_recipient_index > 0) {
+        _recipient_index--;
+      } else {
+        // Go to broadcast
+        _recipient_type = RECIPIENT_BROADCAST;
+        _recipient_index = 0;
+      }
+    } else if (_recipient_type == RECIPIENT_CHANNEL) {
+      if (_recipient_index > 0) {
+        _recipient_index--;
+      } else {
+        // Go to last contact or broadcast if no contacts
+        int total_contacts = _num_recent_senders + _num_recent_contacts;
+        if (total_contacts > 0) {
+          _recipient_type = RECIPIENT_CONTACT;
+          _recipient_index = total_contacts - 1;
+        } else {
+          _recipient_type = RECIPIENT_BROADCAST;
+          _recipient_index = 0;
+        }
+      }
+    } else { // RECIPIENT_BROADCAST
+      // Go to last channel
+      _recipient_type = RECIPIENT_CHANNEL;
+      _recipient_index = 0;
+      // Find the last valid channel
+      ChannelDetails channel;
+      while (the_mesh.getChannel(_recipient_index + 1, channel)) {
+        _recipient_index++;
+      }
+    }
+    _dirty = true;
+  }
+
+  void formatContactId(char* dest, int max_len, const uint8_t* pubkey_prefix) {
+    // Check if the pubkey is all zeros
+    bool all_zeros = true;
+    for (int i = 0; i < 6; i++) {
+      if (pubkey_prefix[i] != 0) {
+        all_zeros = false;
+        break;
+      }
+    }
+    
+    if (all_zeros) {
+      strcpy(dest, "NoKey");
+    } else {
+      // Show first 3 bytes (6 hex chars) of the public key
+      snprintf(dest, max_len, "%02X%02X%02X", 
+               pubkey_prefix[0], pubkey_prefix[1], pubkey_prefix[2]);
+    }
+  }
+
+  void getCurrentRecipientName(char* dest, int max_len) {
+    if (_recipient_type == RECIPIENT_CONTACT) {
+      // First check recent senders, then recent contacts
+      if (_recipient_index < _num_recent_senders) {
+        if (_recent_senders[_recipient_index].name[0] && 
+            strcmp(_recent_senders[_recipient_index].name, "Unknown") != 0) {
+          snprintf(dest, max_len, "%s*", _recent_senders[_recipient_index].name);
+        } else {
+          char id_str[8];
+          formatContactId(id_str, sizeof(id_str), _recent_senders[_recipient_index].pubkey_prefix);
+          snprintf(dest, max_len, "%s*", id_str);
+        }
+      } else {
+        int contact_idx = _recipient_index - _num_recent_senders;
+        if (contact_idx < _num_recent_contacts) {
+          if (_recent_contacts[contact_idx].name[0] && 
+              strcmp(_recent_contacts[contact_idx].name, "Unknown") != 0) {
+            snprintf(dest, max_len, "%s", _recent_contacts[contact_idx].name);
+          } else {
+            char id_str[8];
+            formatContactId(id_str, sizeof(id_str), _recent_contacts[contact_idx].pubkey_prefix);
+            snprintf(dest, max_len, "%s", id_str);
+          }
+        } else {
+          strcpy(dest, "Unknown");
+        }
+      }
+    } else if (_recipient_type == RECIPIENT_CHANNEL) {
+      ChannelDetails channel;
+      if (the_mesh.getChannel(_recipient_index, channel)) {
+        if (channel.name[0]) {
+          snprintf(dest, max_len, "#%s", channel.name);
+        } else if (_recipient_index == 0) {
+          // Channel 0 is typically the default public channel
+          strcpy(dest, "#Public");
+        } else {
+          snprintf(dest, max_len, "#Ch%d", _recipient_index);
+        }
+      } else {
+        snprintf(dest, max_len, "#NoChannel(%d)", _recipient_index);
+      }
+    } else {
+      strcpy(dest, "Broadcast");
+    }
+  }
+
 public:
-  ComposeScreen(UITask* task) : _task(task) { _buf[0] = '\0'; }
+  ComposeScreen(UITask* task) : _task(task) { 
+    _buf[0] = '\0'; 
+    updateRecipientList();
+  }
+  
+  // Public access for UITask
+  int _num_recent_senders = 0;
+  RecentSender _recent_senders[UI_RECENT_LIST_SIZE];
+  int _num_recent_contacts = 0;
+  AdvertPath _recent_contacts[UI_RECENT_LIST_SIZE];
+  
+  void addRecentSender(const char* from_name) {
+    // Look for existing sender
+    for (int i = 0; i < _num_recent_senders; i++) {
+      if (strcmp(_recent_senders[i].name, from_name) == 0) {
+        // Update timestamp and move to front
+        _recent_senders[i].last_msg_time = rtc_clock.getCurrentTime();
+        RecentSender temp = _recent_senders[i];
+        for (int j = i; j > 0; j--) {
+          _recent_senders[j] = _recent_senders[j-1];
+        }
+        _recent_senders[0] = temp;
+        return;
+      }
+    }
+    
+    // Add new sender at front
+    if (_num_recent_senders < UI_RECENT_LIST_SIZE) {
+      _num_recent_senders++;
+    }
+    
+    // Shift existing entries down
+    for (int i = _num_recent_senders - 1; i > 0; i--) {
+      _recent_senders[i] = _recent_senders[i-1];
+    }
+    
+    // Add new entry at front
+    strncpy(_recent_senders[0].name, from_name, sizeof(_recent_senders[0].name) - 1);
+    _recent_senders[0].name[sizeof(_recent_senders[0].name) - 1] = 0;
+    _recent_senders[0].last_msg_time = rtc_clock.getCurrentTime();
+    
+    // Try to get pubkey from contacts
+    ContactInfo* contact = the_mesh.searchContactsByPrefix(from_name);
+    if (contact) {
+      memcpy(_recent_senders[0].pubkey_prefix, contact->id.pub_key, 7);
+    } else {
+      memset(_recent_senders[0].pubkey_prefix, 0, 7);
+    }
+  }
 
   int render(DisplayDriver& display) override {
-    display.setColor(DisplayDriver::GREEN);
+    display.setColor(DisplayDriver::YELLOW);
     display.setTextSize(1);
     display.setCursor(0, 0);
-    display.print("Compose");
+    display.print("To: ");
+    
+    char recipient_name[32];
+    getCurrentRecipientName(recipient_name, sizeof(recipient_name));
+    display.setColor(DisplayDriver::LIGHT);
+    display.print(recipient_name);
 
-    // Counter
+    // Counter on same line
     char cnt[16];
-    sprintf(cnt, "%d/%d", _len, MAX_LEN);
+    sprintf(cnt, " %d/%d", _len, MAX_LEN);
     display.setCursor(display.width() - display.getTextWidth(cnt) - 1, 0);
     display.print(cnt);
 
@@ -560,10 +856,7 @@ public:
     show[_len] = 0;
     display.printWordWrap(show, display.width());
 
-    // Footer help
-    display.setColor(DisplayDriver::YELLOW);
-    display.setCursor(0, display.height() - 10);
-    display.print("Enter=Send  Prev=Back  \x1A\x1B=Move  BKSP=Delete");
+    // Footer help removed for cleaner interface
 
     // Sent popup
     if (millis() < _sent_popup_until) {
@@ -585,20 +878,48 @@ public:
   }
 
   bool handleInput(char c) override {
-    // Navigation keys
-    if (c == KEY_LEFT)  { moveLeft();  return true; }
-    if (c == KEY_RIGHT) { moveRight(); return true; }
+    // Text navigation keys (only when editing message)
+    if (_len > 0 && c == KEY_LEFT)  { moveLeft();  return true; }
+    if (_len > 0 && c == KEY_RIGHT) { moveRight(); return true; }
+    
+    // Recipient navigation keys (when not editing or message is empty)
+    if (_len == 0 && c == KEY_LEFT) {
+      prevRecipient();
+      return true;
+    }
+    if (_len == 0 && c == KEY_RIGHT) {
+      nextRecipient();
+      return true;
+    }
 
-    // Back/escape to home
+    // Up/Down for recipient navigation regardless of message length
     if (c == KEY_PREV) {
-      _task->gotoHomeScreen();
+      // If message is empty, this acts as recipient navigation
+      if (_len == 0) {
+        prevRecipient();
+        return true;
+      } else {
+        // If message exists, go back to home
+        _task->gotoHomeScreen();
+        return true;
+      }
+    }
+    
+    if (c == KEY_NEXT) {
+      nextRecipient();
+      return true;
+    }
+
+    // Tab to cycle recipients forward
+    if (c == KEY_SELECT || c == '\t' || c == 0x09) {
+      nextRecipient();
       return true;
     }
 
     // Send on Enter
     if (c == KEY_ENTER) {
       if (_len > 0) {
-        if (_task->sendText(_buf)) {
+        if (_task->sendTextToRecipient(_buf, _recipient_type, _recipient_index, this)) {
           _sent_popup_until = millis() + 800;
           _len = 0; _cursor = 0; _buf[0] = '\0';
           _dirty = true;
@@ -717,6 +1038,12 @@ void UITask::newMsg(uint8_t path_len, const char* from_name, const char* text, i
   _msgcount = msgcount;
 
   ((MsgPreviewScreen *) msg_preview)->addPreview(path_len, from_name, text);
+  
+  // Add sender to recent senders list if compose screen exists
+  if (compose) {
+    ((ComposeScreen *) compose)->addRecentSender(from_name);
+  }
+  
   setCurrScreen(msg_preview);
 
   if (_display != NULL) {
@@ -991,65 +1318,118 @@ void UITask::toggleGPS() {
   }
 }
 
-bool UITask::sendText(const char* text) {
+bool UITask::sendTextToRecipient(const char* text, int recipient_type, int recipient_index, void* compose_screen) {
   if (!text || !*text) {
     showAlert("Empty message", 800);
     return false;
   }
 
-  // Length guard (match your compose limit)
   size_t msg_len = strnlen(text, 240);
   if (msg_len > MAX_TEXT_LEN) {
     showAlert("Message too long", 800);
     return false;
   }
 
-  // Try approach 1: Send to a known contact
-  AdvertPath recent[1];
-  int n = the_mesh.getRecentlyHeard(recent, 1);
+  ComposeScreen* screen = (ComposeScreen*)compose_screen;
+  uint32_t timestamp = rtc_clock.getCurrentTime();
 
-  if (n > 0 && recent[0].path_len > 0) {
-    // Try 6-byte prefix first (companion radio uses 6 bytes)
-    ContactInfo* contact = the_mesh.lookupContactByPubKey(recent[0].pubkey_prefix, 6);
-    
-    if (contact) {
-      uint32_t expected_ack, est_timeout;
-      uint32_t timestamp = rtc_clock.getCurrentTime();
-      int result = the_mesh.sendMessage(*contact, timestamp, 0, text, expected_ack, est_timeout);
-      
-      if (result == MSG_SEND_SENT_FLOOD) {
-        showAlert("Sent (flood)", 800);
+  // Send to specific contact
+  if (recipient_type == 0) { // RECIPIENT_CONTACT
+    // Check if it's a recent sender first
+    if (recipient_index < screen->_num_recent_senders) {
+      // Try to find contact by name
+      ContactInfo* mesh_contact = the_mesh.searchContactsByPrefix(screen->_recent_senders[recipient_index].name);
+      if (mesh_contact) {
+        uint32_t expected_ack, est_timeout;
+        int result = the_mesh.sendMessage(*mesh_contact, timestamp, 0, text, expected_ack, est_timeout);
+        
+        if (result == MSG_SEND_SENT_FLOOD) {
+          showAlert("Sent (flood)", 800);
+          notify(UIEventType::ack);
+          return true;
+        } else if (result == MSG_SEND_SENT_DIRECT) {
+          showAlert("Sent (direct)", 800);
+          notify(UIEventType::ack);
+          return true;
+        }
+      }
+      showAlert("Contact not found", 800);
+      return false;
+    } else {
+      // It's a recent contact (heard advert)
+      int contact_idx = recipient_index - screen->_num_recent_senders;
+      if (contact_idx < screen->_num_recent_contacts) {
+        ContactInfo* mesh_contact = the_mesh.lookupContactByPubKey(screen->_recent_contacts[contact_idx].pubkey_prefix, 6);
+        if (mesh_contact) {
+          uint32_t expected_ack, est_timeout;
+          int result = the_mesh.sendMessage(*mesh_contact, timestamp, 0, text, expected_ack, est_timeout);
+          
+          if (result == MSG_SEND_SENT_FLOOD) {
+            showAlert("Sent (flood)", 800);
+            notify(UIEventType::ack);
+            return true;
+          } else if (result == MSG_SEND_SENT_DIRECT) {
+            showAlert("Sent (direct)", 800);
+            notify(UIEventType::ack);
+            return true;
+          }
+        }
+      }
+      showAlert("Contact not found", 800);
+      return false;
+    }
+  }
+
+  // Send to group channel
+  if (recipient_type == 1) { // RECIPIENT_CHANNEL
+    ChannelDetails channel;
+    if (the_mesh.getChannel(recipient_index, channel)) {
+      if (the_mesh.sendGroupMessage(timestamp, channel.channel, the_mesh.getNodeName(), text, msg_len)) {
+        char alert_msg[32];
+        snprintf(alert_msg, sizeof(alert_msg), "Sent to #%s", channel.name[0] ? channel.name : "Channel");
+        showAlert(alert_msg, 800);
         notify(UIEventType::ack);
         return true;
-      } else if (result == MSG_SEND_SENT_DIRECT) {
-        showAlert("Sent (direct)", 800);
+      } else {
+        showAlert("Group send failed", 800);
+        return false;
+      }
+    }
+    char alert_msg[32];
+    snprintf(alert_msg, sizeof(alert_msg), "No channel %d", recipient_index);
+    showAlert(alert_msg, 800);
+    return false;
+  }
+
+  // Broadcast (fallback)
+  if (recipient_type == 2) { // RECIPIENT_BROADCAST
+    // Try sending to the first available channel as broadcast
+    ChannelDetails channel;
+    if (the_mesh.getChannel(0, channel)) {
+      if (the_mesh.sendGroupMessage(timestamp, channel.channel, the_mesh.getNodeName(), text, msg_len)) {
+        showAlert("Broadcast sent", 800);
         notify(UIEventType::ack);
         return true;
       }
     }
+    showAlert("No broadcast method", 800);
+    return false;
   }
 
-  // Approach 2: Try sending to a public group channel if one exists
-  ChannelDetails channel;
-  if (the_mesh.getChannel(0, channel)) {
-    uint32_t timestamp = rtc_clock.getCurrentTime();
-    if (the_mesh.sendGroupMessage(timestamp, channel.channel, the_mesh.getNodeName(), text, msg_len)) {
-      showAlert("Sent to group", 800);
-      notify(UIEventType::ack);
-      return true;
-    }
-  }
-
-  // If all else fails, show the specific error
-  if (n == 0) {
-    showAlert("No recent nodes", 800);
-  } else if (recent[0].path_len == 0) {
-    showAlert("No valid path", 800);
-  } else {
-    showAlert("Contact not found", 800);
-  }
-  
+  showAlert("Invalid recipient", 800);
   return false;
+}
+
+bool UITask::sendText(const char* text) {
+  // Legacy method - try to send to first recent contact or channel
+  AdvertPath recent[1];
+  int n = the_mesh.getRecentlyHeard(recent, 1);
+  
+  if (n > 0) {
+    return sendTextToRecipient(text, 0, 0, &recent[0]); // RECIPIENT_CONTACT
+  } else {
+    return sendTextToRecipient(text, 1, 0, nullptr); // RECIPIENT_CHANNEL
+  }
 }
 
 
@@ -1184,8 +1564,7 @@ char UITask::translateCardKB(uint8_t b) {
   if (b == 0x08) return '\b';
 
   // Tab → select (optional)
-  if (b == '\t') return KEY_SELECT;
-  //if (b == 0x09) return KEY_SELECT;
+  if (b == '\t' || b == 0x09) return KEY_SELECT;
 
   // Lone ESC → back/prev
   //if (b == 0x1B) return KEY_PREV;

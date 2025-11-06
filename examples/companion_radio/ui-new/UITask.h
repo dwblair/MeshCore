@@ -18,6 +18,8 @@
 #include "../AbstractUITask.h"
 #include "../NodePrefs.h"
 
+struct AdvertPath; // forward declaration
+
 class UITask : public AbstractUITask {
   DisplayDriver* _display;
   SensorManager* _sensors;
@@ -93,6 +95,7 @@ public:
 
   void gotoComposeScreen();
   bool sendText(const char* text); // returns true if sent OK
+  bool sendTextToRecipient(const char* text, int recipient_type, int recipient_index, void* compose_screen); // returns true if sent OK
   
   // from AbstractUITask
   void msgRead(int msgcount) override;
