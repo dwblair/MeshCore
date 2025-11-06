@@ -529,6 +529,17 @@ class ComposeScreen : public UIScreen {
     uint8_t pubkey_prefix[7];
     uint32_t last_msg_time;
   };
+  
+  // Chat message history
+  struct ChatMessage {
+    char sender_id[4];  // 3 hex chars + null terminator
+    char text[80];      // Message text
+    uint32_t timestamp;
+    bool is_outgoing;   // true if sent by us, false if received
+  };
+  static constexpr int MAX_CHAT_MESSAGES = 8;
+  ChatMessage _chat_history[MAX_CHAT_MESSAGES];
+  int _num_chat_messages = 0;
 
   void insertChar(char ch) {
     if (_len >= MAX_LEN) return;
@@ -549,6 +560,31 @@ class ComposeScreen : public UIScreen {
 
   void moveLeft()  { if (_cursor > 0)    { _cursor--; _dirty = true; } }
   void moveRight() { if (_cursor < _len) { _cursor++; _dirty = true; } }
+
+  void addChatMessage(const char* sender_id, const char* text, bool is_outgoing) {
+    // Shift older messages up
+    if (_num_chat_messages >= MAX_CHAT_MESSAGES) {
+      for (int i = 0; i < MAX_CHAT_MESSAGES - 1; i++) {
+        _chat_history[i] = _chat_history[i + 1];
+      }
+      _num_chat_messages = MAX_CHAT_MESSAGES - 1;
+    }
+    
+    // Add new message at the end
+    ChatMessage* msg = &_chat_history[_num_chat_messages];
+    strncpy(msg->sender_id, sender_id, sizeof(msg->sender_id) - 1);
+    msg->sender_id[sizeof(msg->sender_id) - 1] = 0;
+    strncpy(msg->text, text, sizeof(msg->text) - 1);
+    msg->text[sizeof(msg->text) - 1] = 0;
+    msg->timestamp = rtc_clock.getCurrentTime();
+    msg->is_outgoing = is_outgoing;
+    _num_chat_messages++;
+    _dirty = true;
+  }
+
+  void formatSenderIdFromPubkey(char* dest, const uint8_t* pubkey_prefix) {
+    snprintf(dest, 4, "%02X%01X", pubkey_prefix[0], pubkey_prefix[1] >> 4);
+  }
 
   void updateRecipientList() {
     // Get recently heard adverts
@@ -642,9 +678,12 @@ class ComposeScreen : public UIScreen {
       the_mesh.addChannel("Public", "izOH6cXN6mrJ5e26oRXNcg==");
     }
     
-    // Set default recipient to Public channel (channel 0)
-    _recipient_type = RECIPIENT_CHANNEL;
-    _recipient_index = 0;
+    // Only set default to channel if we don't already have a conversation active
+    if (_recipient_type == RECIPIENT_CHANNEL && _recipient_index == 0 && _num_recent_senders == 0) {
+      // Set default recipient to Public channel (channel 0) only if no active conversation
+      _recipient_type = RECIPIENT_CHANNEL;
+      _recipient_index = 0;
+    }
     
     _dirty = true;
   }
@@ -733,44 +772,52 @@ class ComposeScreen : public UIScreen {
 
   void getCurrentRecipientName(char* dest, int max_len) {
     if (_recipient_type == RECIPIENT_CONTACT) {
+      // DM (Direct Message) to individual contact
+      snprintf(dest, max_len, "DM: ");
+      int prefix_len = 4;
+      
       // First check recent senders, then recent contacts
       if (_recipient_index < _num_recent_senders) {
         if (_recent_senders[_recipient_index].name[0] && 
             strcmp(_recent_senders[_recipient_index].name, "Unknown") != 0) {
-          snprintf(dest, max_len, "%s*", _recent_senders[_recipient_index].name);
+          snprintf(dest + prefix_len, max_len - prefix_len, "%s*", _recent_senders[_recipient_index].name);
         } else {
           char id_str[8];
           formatContactId(id_str, sizeof(id_str), _recent_senders[_recipient_index].pubkey_prefix);
-          snprintf(dest, max_len, "%s*", id_str);
+          snprintf(dest + prefix_len, max_len - prefix_len, "%s*", id_str);
         }
       } else {
         int contact_idx = _recipient_index - _num_recent_senders;
         if (contact_idx < _num_recent_contacts) {
           if (_recent_contacts[contact_idx].name[0] && 
               strcmp(_recent_contacts[contact_idx].name, "Unknown") != 0) {
-            snprintf(dest, max_len, "%s", _recent_contacts[contact_idx].name);
+            snprintf(dest + prefix_len, max_len - prefix_len, "%s", _recent_contacts[contact_idx].name);
           } else {
             char id_str[8];
             formatContactId(id_str, sizeof(id_str), _recent_contacts[contact_idx].pubkey_prefix);
-            snprintf(dest, max_len, "%s", id_str);
+            snprintf(dest + prefix_len, max_len - prefix_len, "%s", id_str);
           }
         } else {
-          strcpy(dest, "Unknown");
+          snprintf(dest + prefix_len, max_len - prefix_len, "Unknown");
         }
       }
     } else if (_recipient_type == RECIPIENT_CHANNEL) {
+      // Channel conversation
+      snprintf(dest, max_len, "Channel: ");
+      int prefix_len = 9;
+      
       ChannelDetails channel;
       if (the_mesh.getChannel(_recipient_index, channel)) {
         if (channel.name[0]) {
-          snprintf(dest, max_len, "#%s", channel.name);
+          snprintf(dest + prefix_len, max_len - prefix_len, "%s", channel.name);
         } else if (_recipient_index == 0) {
           // Channel 0 is typically the default public channel
-          strcpy(dest, "#Public");
+          snprintf(dest + prefix_len, max_len - prefix_len, "Public");
         } else {
-          snprintf(dest, max_len, "#Ch%d", _recipient_index);
+          snprintf(dest + prefix_len, max_len - prefix_len, "Ch%d", _recipient_index);
         }
       } else {
-        snprintf(dest, max_len, "#NoChannel(%d)", _recipient_index);
+        snprintf(dest + prefix_len, max_len - prefix_len, "NoChannel(%d)", _recipient_index);
       }
     } else {
       strcpy(dest, "Broadcast");
@@ -828,15 +875,43 @@ public:
     }
   }
 
+  void handleIncomingMessage(uint8_t path_len, const char* from_name, const char* text, bool is_channel_msg = false) {
+    // Create sender ID for chat display
+    char sender_id[4];
+    ContactInfo* contact = the_mesh.searchContactsByPrefix(from_name);
+    if (contact) {
+      formatSenderIdFromPubkey(sender_id, contact->id.pub_key);
+    } else {
+      // Use first 3 chars of name if no contact found
+      strncpy(sender_id, from_name, 3);
+      sender_id[3] = 0;
+    }
+    
+    if (is_channel_msg) {
+      // Switch to channel view
+      _recipient_type = RECIPIENT_CHANNEL;
+      _recipient_index = 0; // Default to channel 0 (Public)
+    } else {
+      // For DM: Add sender to recent senders and switch to DM view
+      addRecentSender(from_name);
+      
+      // Switch to DM view with this sender (will be at index 0 after addRecentSender)
+      _recipient_type = RECIPIENT_CONTACT;
+      _recipient_index = 0;
+    }
+    
+    // Add message to chat history
+    addChatMessage(sender_id, text, false); // false = incoming message
+    _dirty = true;
+  }
+
   int render(DisplayDriver& display) override {
+    // Header with recipient name and char count
+    char recipient_name[32];
+    getCurrentRecipientName(recipient_name, sizeof(recipient_name));
     display.setColor(DisplayDriver::YELLOW);
     display.setTextSize(1);
     display.setCursor(0, 0);
-    display.print("To: ");
-    
-    char recipient_name[32];
-    getCurrentRecipientName(recipient_name, sizeof(recipient_name));
-    display.setColor(DisplayDriver::LIGHT);
     display.print(recipient_name);
 
     // Counter on same line
@@ -845,16 +920,73 @@ public:
     display.setCursor(display.width() - display.getTextWidth(cnt) - 1, 0);
     display.print(cnt);
 
-    // Divider
-    display.drawRect(0, 10, display.width(), 1);
-
-    // Text area
+    // Chat history area (most of the screen)
+    int chat_start_y = 12;
+    int compose_start_y = display.height() - 20;
+    int chat_height = compose_start_y - chat_start_y - 2;
+    
+    // Display chat messages
     display.setColor(DisplayDriver::LIGHT);
-    display.setCursor(0, 14);
+    int y = chat_start_y;
+    int messages_to_show = chat_height / 10; // ~10 pixels per message line
+    int start_idx = _num_chat_messages > messages_to_show ? _num_chat_messages - messages_to_show : 0;
+    
+    for (int i = start_idx; i < _num_chat_messages && y < compose_start_y - 10; i++) {
+      ChatMessage* msg = &_chat_history[i];
+      display.setCursor(0, y);
+      
+      if (msg->is_outgoing) {
+        display.setColor(DisplayDriver::GREEN);
+        display.print("You: ");
+      } else {
+        display.setColor(DisplayDriver::YELLOW);
+        display.print(msg->sender_id);
+        display.print(": ");
+      }
+      
+      display.setColor(DisplayDriver::LIGHT);
+      // Calculate prefix width and truncate message if needed
+      char prefix[8];
+      if (msg->is_outgoing) {
+        strcpy(prefix, "You: ");
+      } else {
+        snprintf(prefix, sizeof(prefix), "%s: ", msg->sender_id);
+      }
+      int prefix_width = display.getTextWidth(prefix);
+      int remaining_width = display.width() - prefix_width;
+      
+      // Truncate message text to fit remaining width
+      char truncated[60];
+      strncpy(truncated, msg->text, sizeof(truncated) - 1);
+      truncated[sizeof(truncated) - 1] = 0;
+      
+      // Simple truncation - could be improved with proper text measurement
+      if (strlen(truncated) * 6 > remaining_width) { // Rough estimate: 6 pixels per char
+        int max_chars = remaining_width / 6 - 3; // Leave space for "..."
+        if (max_chars > 0 && max_chars < sizeof(truncated)) {
+          truncated[max_chars] = 0;
+          strcat(truncated, "...");
+        }
+      }
+      
+      display.print(truncated);
+      
+      y += 10;
+    }
+
+    // Divider above compose area
+    display.drawRect(0, compose_start_y - 2, display.width(), 1);
+
+    // Compose area at bottom
+    display.setColor(DisplayDriver::LIGHT);
+    display.setCursor(0, compose_start_y);
     char show[MAX_LEN + 1];
     memcpy(show, _buf, _len);
     show[_len] = 0;
-    display.printWordWrap(show, display.width());
+    
+    // Show only what fits in the compose area
+    int compose_width = display.width();
+    display.print(show); // Simple display for now, could add word wrap if needed
 
     // Footer help removed for cleaner interface
 
@@ -920,11 +1052,13 @@ public:
     if (c == KEY_ENTER) {
       if (_len > 0) {
         if (_task->sendTextToRecipient(_buf, _recipient_type, _recipient_index, this)) {
+          // Add our sent message to chat history
+          addChatMessage("You", _buf, true); // true = outgoing message
+          
           _sent_popup_until = millis() + 800;
           _len = 0; _cursor = 0; _buf[0] = '\0';
           _dirty = true;
           _task->notify(UIEventType::ack);
-          _task->showAlert("Message sent", 800);
         } else {
           _task->showAlert("Send failed", 1000);
         }
@@ -1035,16 +1169,54 @@ void UITask::msgRead(int msgcount) {
 }
 
 void UITask::newMsg(uint8_t path_len, const char* from_name, const char* text, int msgcount) {
-  _msgcount = msgcount;
-
-  ((MsgPreviewScreen *) msg_preview)->addPreview(path_len, from_name, text);
+  // Determine if this is a channel message by checking if from_name matches any channel name
+  bool is_channel_msg = false;
   
-  // Add sender to recent senders list if compose screen exists
-  if (compose) {
-    ((ComposeScreen *) compose)->addRecentSender(from_name);
+  for (int i = 0; i < 8; i++) { // Check first 8 channels
+    ChannelDetails channel;
+    if (the_mesh.getChannel(i, channel)) {
+      if (strcmp(from_name, channel.name) == 0) {
+        is_channel_msg = true;
+        break;
+      }
+    } else {
+      break; // No more channels
+    }
   }
   
-  setCurrScreen(msg_preview);
+  if (is_channel_msg) {
+    newChannelMessage(from_name, text, msgcount);
+  } else {
+    newDirectMessage(from_name, text, msgcount);
+  }
+}
+
+void UITask::newDirectMessage(const char* from_name, const char* text, int msgcount) {
+  _msgcount = msgcount;
+
+  // Handle incoming DM in the chat interface
+  if (compose) {
+    ((ComposeScreen *) compose)->handleIncomingMessage(0, from_name, text, false); // false = DM
+    // Switch to the chat screen to show the new message
+    setCurrScreen(compose);
+  }
+
+  if (_display != NULL) {
+    if (!_display->isOn()) _display->turnOn();
+    _auto_off = millis() + AUTO_OFF_MILLIS;  // extend the auto-off timer
+    _next_refresh = 100;  // trigger refresh
+  }
+}
+
+void UITask::newChannelMessage(const char* from_name, const char* text, int msgcount) {
+  _msgcount = msgcount;
+
+  // Handle incoming channel message in the chat interface
+  if (compose) {
+    ((ComposeScreen *) compose)->handleIncomingMessage(0xFF, from_name, text, true); // true = channel
+    // Switch to the chat screen to show the new message
+    setCurrScreen(compose);
+  }
 
   if (_display != NULL) {
     if (!_display->isOn()) _display->turnOn();

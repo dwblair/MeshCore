@@ -102,6 +102,10 @@ public:
   void newMsg(uint8_t path_len, const char* from_name, const char* text, int msgcount) override;
   void notify(UIEventType t = UIEventType::none) override;
   void loop() override;
+  
+  // Additional methods for chat interface
+  void newDirectMessage(const char* from_name, const char* text, int msgcount);
+  void newChannelMessage(const char* from_name, const char* text, int msgcount);
 
   void shutdown(bool restart = false);
 };
