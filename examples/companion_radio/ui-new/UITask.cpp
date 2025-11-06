@@ -3,6 +3,21 @@
 #include "../MyMesh.h"
 #include "target.h"
 
+#ifdef USE_CARDKB
+  #include <Wire.h>
+
+// Select I2C bus for CardKB
+#ifndef CARDKB_WIRE
+  #ifdef USE_WIRE1_FOR_CARDKB
+    #define CARDKB_WIRE Wire1
+  #else
+    #define CARDKB_WIRE Wire
+  #endif
+#endif
+
+  static constexpr uint8_t CARDKB_ADDR = 0x5F;
+#endif
+
 #ifndef AUTO_OFF_MILLIS
   #define AUTO_OFF_MILLIS     15000   // 15 seconds
 #endif
@@ -19,6 +34,7 @@
 #ifndef UI_RECENT_LIST_SIZE
   #define UI_RECENT_LIST_SIZE 4
 #endif
+
 
 #define PRESS_LABEL "long press"
 
@@ -375,6 +391,14 @@ public:
       _shutdown_init = true;  // need to wait for button to be released
       return true;
     }
+    
+    /*
+    if (c >= 32 && c <= 126) {
+  _task->showAlert("KEY", 200); // visual ping on any printable char
+  return true;
+} 
+*/
+
     return false;
   }
 };
@@ -504,6 +528,13 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
   home = new HomeScreen(this, &rtc_clock, sensors, node_prefs);
   msg_preview = new MsgPreviewScreen(this, &rtc_clock);
   setCurrScreen(splash);
+
+ #ifdef USE_CARDKB
+  initCardKB();
+  if (_cardkb_present) showAlert("CardKB: OK", 800);
+  else                showAlert("CardKB: NOT FOUND", 1200);
+#endif
+
 }
 
 void UITask::showAlert(const char* text, int duration_millis) {
@@ -669,6 +700,16 @@ void UITask::loop() {
   }
 #endif
 
+#ifdef USE_CARDKB
+  if (c == 0) {
+    char kc = pollCardKB();
+    if (kc) {
+      // Keep the exact same UX as button presses: wake/extend display via checkDisplayOn
+      c = checkDisplayOn(kc);
+    }
+  }
+#endif
+
   if (c != 0 && curr) {
     curr->handleInput(c);
     _auto_off = millis() + AUTO_OFF_MILLIS;   // extend auto-off timer
@@ -809,3 +850,128 @@ void UITask::toggleBuzzer() {
     _next_refresh = 0;  // trigger refresh
   #endif
 }
+
+#ifdef USE_CARDKB
+void UITask::initCardKB(int sdaPin, int sclPin) {
+  // Adafruit nRF52 core: begin() has no sda/scl overload
+  #if defined(ARDUINO_ARCH_NRF5) || defined(ARDUINO_ARCH_NRF52)
+    (void)sdaPin; (void)sclPin;
+    CARDKB_WIRE.begin();
+
+  // ESP32/ESP8266: begin(sda, scl) is supported
+  #elif defined(ARDUINO_ARCH_ESP32) || defined(ARDUINO_ARCH_ESP8266)
+    if (sdaPin >= 0 && sclPin >= 0) CARDKB_WIRE.begin(sdaPin, sclPin);
+    else CARDKB_WIRE.begin();
+
+  // RP2040 (Arduino-mbed): set pins then begin()
+  #elif defined(ARDUINO_ARCH_RP2040)
+    if (sdaPin >= 0) CARDKB_WIRE.setSDA(sdaPin);
+    if (sclPin >= 0) CARDKB_WIRE.setSCL(sclPin);
+    CARDKB_WIRE.begin();
+
+  // Fallback: just begin()
+  #else
+    (void)sdaPin; (void)sclPin;
+    CARDKB_WIRE.begin();
+  #endif
+
+  // Presence probe
+  CARDKB_WIRE.beginTransmission(CARDKB_ADDR);
+  _cardkb_present = (CARDKB_WIRE.endTransmission() == 0);
+  _cardkb_next_poll = 0;
+  _cardkb_esc_state = 0;
+}
+#endif
+
+#ifdef USE_CARDKB
+
+char UITask::pollCardKB() {
+  if (!_cardkb_present) return 0;
+
+  // Light throttle
+  uint32_t now = millis();
+  if (now < _cardkb_next_poll) return 0;
+  _cardkb_next_poll = now + 5;
+
+  // Read one byte (0 means "no key")
+  CARDKB_WIRE.requestFrom((int)CARDKB_ADDR, 1);
+  if (!CARDKB_WIRE.available()) return 0;
+
+  uint8_t b = CARDKB_WIRE.read();
+  
+  /*
+  if (b != 0) {
+  static uint32_t last_dbg = 0;
+  uint32_t now = millis();
+  if (now - last_dbg > 200) { // rate-limit popups
+    char dbg[16]; sprintf(dbg, "K:%02X", b);
+    showAlert(dbg, 150);
+    last_dbg = now;
+  }
+}
+*/
+
+
+  if (b == 0) return 0;
+
+  // Handle arrow escape sequences ESC [ A/B/C/D
+  if (_cardkb_esc_state == 0) {
+    if (b == 0x1B) {           // ESC
+      _cardkb_esc_state = 1;
+      return 0;
+    }
+  } else if (_cardkb_esc_state == 1) {
+    if (b == '[') {
+      _cardkb_esc_state = 2;
+      return 0;
+    } else {
+      // Not an arrow sequence, reset and fall through to translation
+      _cardkb_esc_state = 0;
+      // (no early return)
+    }
+  } else if (_cardkb_esc_state == 2) {
+    _cardkb_esc_state = 0;
+    switch (b) {
+      case 'A': return KEY_PREV;   // Up
+      case 'B': return KEY_NEXT;   // Down
+      case 'C': return KEY_RIGHT;  // Right
+      case 'D': return KEY_LEFT;   // Left
+      default: return 0;
+    }
+  }
+
+  return translateCardKB(b);
+}
+
+char UITask::translateCardKB(uint8_t b) {
+  // Printable ASCII
+  if (b >= 32 && b <= 126) return (char)b;
+
+  // Enter
+  if (b == '\r' || b == '\n') return KEY_ENTER;
+
+  // Backspace (if your composer expects a specific keycode, change this)
+  //if (b == 0x08 || b == 0x7F) return '\b';
+  if (b == 0x08) return '\b';
+
+  // Tab → select (optional)
+  if (b == '\t') return KEY_SELECT;
+  //if (b == 0x09) return KEY_SELECT;
+
+  // Lone ESC → back/prev
+  //if (b == 0x1B) return KEY_PREV;
+  if (b == 0x1B) return KEY_PREV;
+
+  switch (b) {
+    case 0xB5: return KEY_PREV;   // Up
+    case 0xB6: return KEY_NEXT;   // Down
+    case 0xB7: return KEY_RIGHT;  // Right
+    case 0xB4: return KEY_LEFT;   // Left
+  }
+  
+  return 0;
+}
+
+#endif // USE_CARDKB
+
+

@@ -40,6 +40,23 @@ class UITask : public AbstractUITask {
   int last_led_increment = 0;
 #endif
 
+// ---- CardKB (I2C: 0x5F) ---------------------------------
+#ifdef USE_CARDKB
+public:
+  // If you want to call it from begin(), make it public
+  void initCardKB(int sdaPin = -1, int sclPin = -1);
+
+private:
+  bool     _cardkb_present = false;
+  uint32_t _cardkb_next_poll = 0;
+  uint8_t  _cardkb_esc_state = 0; // 0=none,1=ESC,2='['
+
+  char     pollCardKB();               // returns 0 if no key
+  char     translateCardKB(uint8_t b); // ASCII + special keys
+#endif
+// ----------------------------------------------------------
+
+
   UIScreen* splash;
   UIScreen* home;
   UIScreen* msg_preview;
