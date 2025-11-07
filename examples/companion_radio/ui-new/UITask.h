@@ -85,6 +85,11 @@ public:
   void begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* node_prefs);
 
   void gotoHomeScreen() { setCurrScreen(home); }
+  void gotoMsgPreviewScreen() { setCurrScreen(msg_preview); }
+  void gotoComposeScreen();
+  void gotoPrevScreen();
+  void gotoNextScreen();
+  
   void showAlert(const char* text, int duration_millis);
   int  getMsgCount() const { return _msgcount; }
   bool hasDisplay() const { return _display != NULL; }
@@ -92,8 +97,6 @@ public:
 
   void toggleBuzzer();
   void toggleGPS();
-
-  void gotoComposeScreen();
   bool sendText(const char* text); // returns true if sent OK
   bool sendTextToRecipient(const char* text, int recipient_type, int recipient_index, void* compose_screen); // returns true if sent OK
   

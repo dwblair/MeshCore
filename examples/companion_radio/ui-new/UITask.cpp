@@ -20,7 +20,7 @@
 #endif
 
 #ifndef AUTO_OFF_MILLIS
-  #define AUTO_OFF_MILLIS     15000   // 15 seconds
+  #define AUTO_OFF_MILLIS     120000   // 2 minutes
 #endif
 #define BOOT_SCREEN_MILLIS   3000   // 3 seconds
 
@@ -80,7 +80,7 @@ public:
 
   void poll() override {
     if (millis() >= dismiss_after) {
-      _task->gotoHomeScreen();
+      _task->gotoComposeScreen();
     }
   }
 };
@@ -353,18 +353,28 @@ public:
   }
 
   bool handleInput(char c) override {
-  
+    
+    // LEFT/RIGHT for screen navigation
+    if (c == KEY_LEFT) {
+      _task->gotoPrevScreen();
+      return true;
+    }
+    if (c == KEY_RIGHT) {
+      _task->gotoNextScreen();
+      return true;
+    }
      
-     if (c == KEY_ENTER && _page == HomePage::FIRST) {
+    if (c == KEY_ENTER && _page == HomePage::FIRST) {
       _task->gotoComposeScreen();
       return true;
     }
     
-    if (c == KEY_LEFT || c == KEY_PREV) {
+    // UP/DOWN for page navigation within HomeScreen
+    if (c == KEY_PREV) {
       _page = (_page + HomePage::Count - 1) % HomePage::Count;
       return true;
     }
-    if (c == KEY_NEXT || c == KEY_RIGHT) {
+    if (c == KEY_NEXT) {
       _page = (_page + 1) % HomePage::Count;
       if (_page == HomePage::RECENT) {
         _task->showAlert("Recent adverts", 800);
@@ -483,7 +493,18 @@ public:
   }
 
   bool handleInput(char c) override {
-    if (c == KEY_NEXT || c == KEY_RIGHT) {
+    // LEFT/RIGHT for screen navigation
+    if (c == KEY_LEFT) {
+      _task->gotoPrevScreen();
+      return true;
+    }
+    if (c == KEY_RIGHT) {
+      _task->gotoNextScreen();
+      return true;
+    }
+    
+    // UP/DOWN for navigating through messages
+    if (c == KEY_NEXT || c == KEY_PREV) {
       num_unread--;
       if (num_unread == 0) {
         _task->gotoHomeScreen();
@@ -511,7 +532,6 @@ class ComposeScreen : public UIScreen {
   char _buf[MAX_LEN + 1];
   int  _len = 0;
   int  _cursor = 0;
-  unsigned long _sent_popup_until = 0;
   bool _dirty = true;
   
   // Recipient selection
@@ -536,10 +556,35 @@ class ComposeScreen : public UIScreen {
     char text[80];      // Message text
     uint32_t timestamp;
     bool is_outgoing;   // true if sent by us, false if received
+    uint32_t sent_indicator_until; // timestamp until which to show [SENT]
   };
   static constexpr int MAX_CHAT_MESSAGES = 8;
-  ChatMessage _chat_history[MAX_CHAT_MESSAGES];
-  int _num_chat_messages = 0;
+  static constexpr int MAX_CONVERSATIONS = 16;
+  
+  // Conversation identifier
+  struct ConversationId {
+    RecipientType type;
+    int index;
+    char identifier[16]; // For display/debug purposes
+    
+    bool matches(RecipientType t, int idx) const {
+      return type == t && index == idx;
+    }
+  };
+  
+  // Per-conversation chat history
+  struct Conversation {
+    ConversationId id;
+    ChatMessage messages[MAX_CHAT_MESSAGES];
+    int num_messages;
+    bool active;
+    
+    Conversation() : num_messages(0), active(false) {}
+  };
+  
+  Conversation _conversations[MAX_CONVERSATIONS];
+  int _num_conversations = 0;
+  int _current_conversation_idx = -1;
 
   void insertChar(char ch) {
     if (_len >= MAX_LEN) return;
@@ -561,25 +606,236 @@ class ComposeScreen : public UIScreen {
   void moveLeft()  { if (_cursor > 0)    { _cursor--; _dirty = true; } }
   void moveRight() { if (_cursor < _len) { _cursor++; _dirty = true; } }
 
-  void addChatMessage(const char* sender_id, const char* text, bool is_outgoing) {
-    // Shift older messages up
-    if (_num_chat_messages >= MAX_CHAT_MESSAGES) {
-      for (int i = 0; i < MAX_CHAT_MESSAGES - 1; i++) {
-        _chat_history[i] = _chat_history[i + 1];
+  // Find or create conversation for current recipient
+  int findOrCreateConversation(RecipientType type, int index) {
+    // Look for existing conversation
+    for (int i = 0; i < _num_conversations; i++) {
+      if (_conversations[i].active && _conversations[i].id.matches(type, index)) {
+        return i;
       }
-      _num_chat_messages = MAX_CHAT_MESSAGES - 1;
+    }
+    
+    // Create new conversation if space available
+    if (_num_conversations < MAX_CONVERSATIONS) {
+      int idx = _num_conversations++;
+      Conversation* conv = &_conversations[idx];
+      conv->active = true;
+      conv->id.type = type;
+      conv->id.index = index;
+      conv->num_messages = 0;
+      
+      // Set identifier for display/debug
+      if (type == RECIPIENT_CHANNEL) {
+        snprintf(conv->id.identifier, sizeof(conv->id.identifier), "Ch%d", index);
+      } else if (type == RECIPIENT_CONTACT) {
+        snprintf(conv->id.identifier, sizeof(conv->id.identifier), "C%d", index);
+      } else {
+        snprintf(conv->id.identifier, sizeof(conv->id.identifier), "BC");
+      }
+      
+      return idx;
+    }
+    
+    // If no space, reuse oldest conversation
+    int oldest_idx = 0;
+    uint32_t oldest_time = UINT32_MAX;
+    for (int i = 0; i < _num_conversations; i++) {
+      if (_conversations[i].num_messages > 0) {
+        uint32_t last_msg_time = _conversations[i].messages[_conversations[i].num_messages - 1].timestamp;
+        if (last_msg_time < oldest_time) {
+          oldest_time = last_msg_time;
+          oldest_idx = i;
+        }
+      }
+    }
+    
+    // Clear and reuse the oldest conversation
+    Conversation* conv = &_conversations[oldest_idx];
+    conv->id.type = type;
+    conv->id.index = index;
+    conv->num_messages = 0;
+    conv->active = true;
+    
+    if (type == RECIPIENT_CHANNEL) {
+      snprintf(conv->id.identifier, sizeof(conv->id.identifier), "Ch%d", index);
+    } else if (type == RECIPIENT_CONTACT) {
+      snprintf(conv->id.identifier, sizeof(conv->id.identifier), "C%d", index);
+    } else {
+      snprintf(conv->id.identifier, sizeof(conv->id.identifier), "BC");
+    }
+    
+    return oldest_idx;
+  }
+  
+  // Add message to current conversation
+  void addChatMessage(const char* sender_id, const char* text, bool is_outgoing) {
+    int conv_idx = findOrCreateConversation(_recipient_type, _recipient_index);
+    Conversation* conv = &_conversations[conv_idx];
+    
+    // Shift older messages up if conversation is full
+    if (conv->num_messages >= MAX_CHAT_MESSAGES) {
+      for (int i = 0; i < MAX_CHAT_MESSAGES - 1; i++) {
+        conv->messages[i] = conv->messages[i + 1];
+      }
+      conv->num_messages = MAX_CHAT_MESSAGES - 1;
     }
     
     // Add new message at the end
-    ChatMessage* msg = &_chat_history[_num_chat_messages];
+    ChatMessage* msg = &conv->messages[conv->num_messages];
     strncpy(msg->sender_id, sender_id, sizeof(msg->sender_id) - 1);
     msg->sender_id[sizeof(msg->sender_id) - 1] = 0;
     strncpy(msg->text, text, sizeof(msg->text) - 1);
     msg->text[sizeof(msg->text) - 1] = 0;
     msg->timestamp = rtc_clock.getCurrentTime();
     msg->is_outgoing = is_outgoing;
-    _num_chat_messages++;
+    
+    // Set up [SENT] indicator for outgoing messages (0.5 seconds)
+    if (is_outgoing) {
+      msg->sent_indicator_until = millis() + 500;
+    } else {
+      msg->sent_indicator_until = 0;
+    }
+    
+    conv->num_messages++;
+    _current_conversation_idx = conv_idx;
     _dirty = true;
+  }
+
+  // Switch to a different conversation when recipient changes
+  void switchConversation(RecipientType type, int index) {
+    _current_conversation_idx = findOrCreateConversation(type, index);
+    _dirty = true;
+  }
+
+  // Check if a conversation exists and has messages
+  bool hasActiveConversation(RecipientType type, int index) {
+    for (int i = 0; i < _num_conversations; i++) {
+      if (_conversations[i].active && _conversations[i].id.matches(type, index)) {
+        return _conversations[i].num_messages > 0;
+      }
+    }
+    return false;
+  }
+
+  // Build filtered recipient list
+  struct FilteredRecipient {
+    RecipientType type;
+    int index;
+    char name[32];
+  };
+  FilteredRecipient _filtered_recipients[32];
+  int _num_filtered_recipients = 0;
+  int _current_filtered_index = 0;
+
+  void buildFilteredRecipientList() {
+    _num_filtered_recipients = 0;
+    
+    // Always include Public channel (channel 0)
+    FilteredRecipient* pub = &_filtered_recipients[_num_filtered_recipients++];
+    pub->type = RECIPIENT_CHANNEL;
+    pub->index = 0;
+    strcpy(pub->name, "Public");
+    
+    // Add channels with active conversations
+    for (int i = 1; i < 32; i++) { // Skip channel 0 (already added)
+      ChannelDetails channel;
+      if (the_mesh.getChannel(i, channel)) {
+        if (hasActiveConversation(RECIPIENT_CHANNEL, i)) {
+          if (_num_filtered_recipients < 32) {
+            FilteredRecipient* ch = &_filtered_recipients[_num_filtered_recipients++];
+            ch->type = RECIPIENT_CHANNEL;
+            ch->index = i;
+            if (channel.name[0]) {
+              strncpy(ch->name, channel.name, sizeof(ch->name) - 1);
+              ch->name[sizeof(ch->name) - 1] = 0;
+            } else {
+              snprintf(ch->name, sizeof(ch->name), "Ch%d", i);
+            }
+          }
+        }
+      } else {
+        break; // No more channels
+      }
+    }
+    
+    // Add recent senders (contacts we've messaged with recently)
+    for (int i = 0; i < _num_recent_senders && _num_filtered_recipients < 32; i++) {
+      FilteredRecipient* contact = &_filtered_recipients[_num_filtered_recipients++];
+      contact->type = RECIPIENT_CONTACT;
+      contact->index = i;
+      strncpy(contact->name, _recent_senders[i].name, sizeof(contact->name) - 1);
+      contact->name[sizeof(contact->name) - 1] = 0;
+    }
+    
+    // Add recent contacts (heard adverts) that aren't already in recent senders
+    for (int i = 0; i < _num_recent_contacts && _num_filtered_recipients < 32; i++) {
+      // Check if this contact is already in recent senders
+      bool already_added = false;
+      for (int j = 0; j < _num_recent_senders; j++) {
+        if (memcmp(_recent_senders[j].pubkey_prefix, _recent_contacts[i].pubkey_prefix, 7) == 0) {
+          already_added = true;
+          break;
+        }
+      }
+      
+      if (!already_added) {
+        FilteredRecipient* contact = &_filtered_recipients[_num_filtered_recipients++];
+        contact->type = RECIPIENT_CONTACT;
+        contact->index = _num_recent_senders + i; // Adjust index for recent contacts
+        if (_recent_contacts[i].name[0]) {
+          strncpy(contact->name, _recent_contacts[i].name, sizeof(contact->name) - 1);
+          contact->name[sizeof(contact->name) - 1] = 0;
+        } else {
+          // Format as hex ID if no name
+          snprintf(contact->name, sizeof(contact->name), "%02X%02X%02X",
+                   _recent_contacts[i].pubkey_prefix[0],
+                   _recent_contacts[i].pubkey_prefix[1], 
+                   _recent_contacts[i].pubkey_prefix[2]);
+        }
+      }
+    }
+    
+    // Add contacts with active conversations that aren't in recent lists
+    for (int i = 0; i < _num_conversations; i++) {
+      if (_conversations[i].active && _conversations[i].id.type == RECIPIENT_CONTACT && _conversations[i].num_messages > 0) {
+        // Check if this conversation is already represented in filtered list
+        bool already_added = false;
+        for (int j = 0; j < _num_filtered_recipients; j++) {
+          if (_filtered_recipients[j].type == RECIPIENT_CONTACT && 
+              _filtered_recipients[j].index == _conversations[i].id.index) {
+            already_added = true;
+            break;
+          }
+        }
+        
+        if (!already_added && _num_filtered_recipients < 32) {
+          FilteredRecipient* contact = &_filtered_recipients[_num_filtered_recipients++];
+          contact->type = RECIPIENT_CONTACT;
+          contact->index = _conversations[i].id.index;
+          snprintf(contact->name, sizeof(contact->name), "%s", _conversations[i].id.identifier);
+        }
+      }
+    }
+    
+    // Update current recipient to match filtered list
+    updateCurrentFilteredIndex();
+  }
+  
+  void updateCurrentFilteredIndex() {
+    // Find current recipient in filtered list
+    for (int i = 0; i < _num_filtered_recipients; i++) {
+      if (_filtered_recipients[i].type == _recipient_type && _filtered_recipients[i].index == _recipient_index) {
+        _current_filtered_index = i;
+        return;
+      }
+    }
+    
+    // If not found, default to first entry (Public)
+    if (_num_filtered_recipients > 0) {
+      _current_filtered_index = 0;
+      _recipient_type = _filtered_recipients[0].type;
+      _recipient_index = _filtered_recipients[0].index;
+    }
   }
 
   void formatSenderIdFromPubkey(char* dest, const uint8_t* pubkey_prefix) {
@@ -678,6 +934,9 @@ class ComposeScreen : public UIScreen {
       the_mesh.addChannel("Public", "izOH6cXN6mrJ5e26oRXNcg==");
     }
     
+    // Build the filtered recipient list
+    buildFilteredRecipientList();
+    
     // Only set default to channel if we don't already have a conversation active
     if (_recipient_type == RECIPIENT_CHANNEL && _recipient_index == 0 && _num_recent_senders == 0) {
       // Set default recipient to Public channel (channel 0) only if no active conversation
@@ -689,65 +948,42 @@ class ComposeScreen : public UIScreen {
   }
 
   void nextRecipient() {
-    if (_recipient_type == RECIPIENT_CONTACT) {
-      _recipient_index++;
-      // First check recent senders, then recent contacts
-      int total_contacts = _num_recent_senders + _num_recent_contacts;
-      if (_recipient_index >= total_contacts || total_contacts == 0) {
-        _recipient_type = RECIPIENT_CHANNEL;
-        _recipient_index = 0;
-      }
-    } else if (_recipient_type == RECIPIENT_CHANNEL) {
-      _recipient_index++;
-      ChannelDetails channel;
-      if (!the_mesh.getChannel(_recipient_index, channel)) {
-        _recipient_type = RECIPIENT_BROADCAST;
-        _recipient_index = 0;
-      }
-    } else { // RECIPIENT_BROADCAST
-      _recipient_type = RECIPIENT_CONTACT;
+    // Rebuild filtered list to account for new conversations
+    buildFilteredRecipientList();
+    
+    if (_num_filtered_recipients == 0) {
+      // Fallback to Public if no recipients
+      _recipient_type = RECIPIENT_CHANNEL;
       _recipient_index = 0;
-      // If no contacts, skip directly to channels
-      if (_num_recent_senders == 0 && _num_recent_contacts == 0) {
-        _recipient_type = RECIPIENT_CHANNEL;
-      }
+      _current_filtered_index = 0;
+    } else {
+      // Move to next in filtered list
+      _current_filtered_index = (_current_filtered_index + 1) % _num_filtered_recipients;
+      _recipient_type = _filtered_recipients[_current_filtered_index].type;
+      _recipient_index = _filtered_recipients[_current_filtered_index].index;
     }
+    
+    switchConversation(_recipient_type, _recipient_index);
     _dirty = true;
   }
 
   void prevRecipient() {
-    if (_recipient_type == RECIPIENT_CONTACT) {
-      if (_recipient_index > 0) {
-        _recipient_index--;
-      } else {
-        // Go to broadcast
-        _recipient_type = RECIPIENT_BROADCAST;
-        _recipient_index = 0;
-      }
-    } else if (_recipient_type == RECIPIENT_CHANNEL) {
-      if (_recipient_index > 0) {
-        _recipient_index--;
-      } else {
-        // Go to last contact or broadcast if no contacts
-        int total_contacts = _num_recent_senders + _num_recent_contacts;
-        if (total_contacts > 0) {
-          _recipient_type = RECIPIENT_CONTACT;
-          _recipient_index = total_contacts - 1;
-        } else {
-          _recipient_type = RECIPIENT_BROADCAST;
-          _recipient_index = 0;
-        }
-      }
-    } else { // RECIPIENT_BROADCAST
-      // Go to last channel
+    // Rebuild filtered list to account for new conversations
+    buildFilteredRecipientList();
+    
+    if (_num_filtered_recipients == 0) {
+      // Fallback to Public if no recipients
       _recipient_type = RECIPIENT_CHANNEL;
       _recipient_index = 0;
-      // Find the last valid channel
-      ChannelDetails channel;
-      while (the_mesh.getChannel(_recipient_index + 1, channel)) {
-        _recipient_index++;
-      }
+      _current_filtered_index = 0;
+    } else {
+      // Move to previous in filtered list
+      _current_filtered_index = (_current_filtered_index + _num_filtered_recipients - 1) % _num_filtered_recipients;
+      _recipient_type = _filtered_recipients[_current_filtered_index].type;
+      _recipient_index = _filtered_recipients[_current_filtered_index].index;
     }
+    
+    switchConversation(_recipient_type, _recipient_index);
     _dirty = true;
   }
 
@@ -771,63 +1007,31 @@ class ComposeScreen : public UIScreen {
   }
 
   void getCurrentRecipientName(char* dest, int max_len) {
-    if (_recipient_type == RECIPIENT_CONTACT) {
-      // DM (Direct Message) to individual contact
-      snprintf(dest, max_len, "DM: ");
-      int prefix_len = 4;
-      
-      // First check recent senders, then recent contacts
-      if (_recipient_index < _num_recent_senders) {
-        if (_recent_senders[_recipient_index].name[0] && 
-            strcmp(_recent_senders[_recipient_index].name, "Unknown") != 0) {
-          snprintf(dest + prefix_len, max_len - prefix_len, "%s*", _recent_senders[_recipient_index].name);
-        } else {
-          char id_str[8];
-          formatContactId(id_str, sizeof(id_str), _recent_senders[_recipient_index].pubkey_prefix);
-          snprintf(dest + prefix_len, max_len - prefix_len, "%s*", id_str);
-        }
-      } else {
-        int contact_idx = _recipient_index - _num_recent_senders;
-        if (contact_idx < _num_recent_contacts) {
-          if (_recent_contacts[contact_idx].name[0] && 
-              strcmp(_recent_contacts[contact_idx].name, "Unknown") != 0) {
-            snprintf(dest + prefix_len, max_len - prefix_len, "%s", _recent_contacts[contact_idx].name);
-          } else {
-            char id_str[8];
-            formatContactId(id_str, sizeof(id_str), _recent_contacts[contact_idx].pubkey_prefix);
-            snprintf(dest + prefix_len, max_len - prefix_len, "%s", id_str);
-          }
-        } else {
-          snprintf(dest + prefix_len, max_len - prefix_len, "Unknown");
-        }
-      }
-    } else if (_recipient_type == RECIPIENT_CHANNEL) {
-      // Channel conversation
-      snprintf(dest, max_len, "Channel: ");
-      int prefix_len = 9;
-      
-      ChannelDetails channel;
-      if (the_mesh.getChannel(_recipient_index, channel)) {
-        if (channel.name[0]) {
-          snprintf(dest + prefix_len, max_len - prefix_len, "%s", channel.name);
-        } else if (_recipient_index == 0) {
-          // Channel 0 is typically the default public channel
-          snprintf(dest + prefix_len, max_len - prefix_len, "Public");
-        } else {
-          snprintf(dest + prefix_len, max_len - prefix_len, "Ch%d", _recipient_index);
-        }
-      } else {
-        snprintf(dest + prefix_len, max_len - prefix_len, "NoChannel(%d)", _recipient_index);
-      }
+    // Use filtered recipient name if available
+    if (_current_filtered_index >= 0 && _current_filtered_index < _num_filtered_recipients) {
+      snprintf(dest, max_len, "To: %s", _filtered_recipients[_current_filtered_index].name);
     } else {
-      strcpy(dest, "Broadcast");
+      // Fallback to original logic
+      if (_recipient_type == RECIPIENT_CONTACT) {
+        snprintf(dest, max_len, "To: Contact%d", _recipient_index);
+      } else if (_recipient_type == RECIPIENT_CHANNEL) {
+        snprintf(dest, max_len, "To: Ch%d", _recipient_index);
+      } else {
+        strcpy(dest, "To: Broadcast");
+      }
     }
   }
 
 public:
   ComposeScreen(UITask* task) : _task(task) { 
-    _buf[0] = '\0'; 
+    _buf[0] = '\0';
+    _num_conversations = 0;
+    _current_conversation_idx = -1;
+    _num_filtered_recipients = 0;
+    _current_filtered_index = 0;
     updateRecipientList();
+    // Initialize with current recipient
+    switchConversation(_recipient_type, _recipient_index);
   }
   
   // Public access for UITask
@@ -876,32 +1080,155 @@ public:
   }
 
   void handleIncomingMessage(uint8_t path_len, const char* from_name, const char* text, bool is_channel_msg = false) {
-    // Create sender ID for chat display
+    // Create sender ID for chat display and clean message text
     char sender_id[4];
-    ContactInfo* contact = the_mesh.searchContactsByPrefix(from_name);
-    if (contact) {
-      formatSenderIdFromPubkey(sender_id, contact->id.pub_key);
-    } else {
-      // Use first 3 chars of name if no contact found
-      strncpy(sender_id, from_name, 3);
-      sender_id[3] = 0;
-    }
+    char clean_text[80];
+    strncpy(clean_text, text, sizeof(clean_text) - 1);
+    clean_text[sizeof(clean_text) - 1] = 0;
     
     if (is_channel_msg) {
-      // Switch to channel view
-      _recipient_type = RECIPIENT_CHANNEL;
-      _recipient_index = 0; // Default to channel 0 (Public)
-    } else {
-      // For DM: Add sender to recent senders and switch to DM view
-      addRecentSender(from_name);
+      // For channel messages, text might be in format:
+      // "ActualSender: message" or "ChannelName: ActualSender: message" or other variants
+      // We need to extract the actual sender's name, not the channel name
       
-      // Switch to DM view with this sender (will be at index 0 after addRecentSender)
-      _recipient_type = RECIPIENT_CONTACT;
-      _recipient_index = 0;
+      const char* colon_pos = strchr(text, ':');
+      if (colon_pos) {
+        const char* second_colon = strchr(colon_pos + 1, ':');
+        
+        if (second_colon) {
+          // Format appears to be "ChannelName: ActualSender: message"
+          // Extract the ActualSender part (between first and second colon)
+          const char* sender_start = colon_pos + 1;
+          while (*sender_start == ' ') sender_start++; // Skip spaces
+          
+          // Find end of sender name (before second colon)
+          const char* sender_end = second_colon;
+          while (sender_end > sender_start && *(sender_end - 1) == ' ') sender_end--; // Trim trailing spaces
+          
+          int sender_len = sender_end - sender_start;
+          if (sender_len >= 1) {
+            // Take first 3 characters of the actual sender name
+            int copy_len = sender_len < 3 ? sender_len : 3;
+            strncpy(sender_id, sender_start, copy_len);
+            sender_id[copy_len] = 0;
+            
+            // Clean message starts after second colon
+            const char* msg_start = second_colon + 1;
+            while (*msg_start == ' ') msg_start++; // Skip spaces
+            strncpy(clean_text, msg_start, sizeof(clean_text) - 1);
+            clean_text[sizeof(clean_text) - 1] = 0;
+          } else {
+            strcpy(sender_id, "???");
+          }
+        } else {
+          // Format might be "ActualSender: message" (single colon)
+          // Extract sender name before the colon
+          const char* sender_start = text;
+          const char* sender_end = colon_pos;
+          while (sender_end > sender_start && *(sender_end - 1) == ' ') sender_end--; // Trim trailing spaces
+          
+          int sender_len = sender_end - sender_start;
+          if (sender_len >= 1) {
+            // Take first 3 characters of the sender name
+            int copy_len = sender_len < 3 ? sender_len : 3;
+            strncpy(sender_id, sender_start, copy_len);
+            sender_id[copy_len] = 0;
+            
+            // Clean message starts after colon
+            const char* msg_start = colon_pos + 1;
+            while (*msg_start == ' ') msg_start++; // Skip spaces
+            strncpy(clean_text, msg_start, sizeof(clean_text) - 1);
+            clean_text[sizeof(clean_text) - 1] = 0;
+          } else {
+            strcpy(sender_id, "???");
+          }
+        }
+      } else {
+        // No colon found - use from_name as fallback, but prefer actual sender over channel
+        // If from_name starts with #, it's likely a channel name, so use first 3 chars
+        if (from_name[0] == '#') {
+          strcpy(sender_id, "???"); // Channel name without sender info
+        } else {
+          // Take first 3 chars of from_name
+          strncpy(sender_id, from_name, 3);
+          sender_id[3] = 0;
+        }
+      }
+    } else {
+      // For direct messages, use the sender contact info
+      ContactInfo* contact = the_mesh.searchContactsByPrefix(from_name);
+      if (contact) {
+        formatSenderIdFromPubkey(sender_id, contact->id.pub_key);
+      } else {
+        // Use first 3 chars of name if no contact found
+        strncpy(sender_id, from_name, 3);
+        sender_id[3] = 0;
+      }
     }
     
-    // Add message to chat history
-    addChatMessage(sender_id, text, false); // false = incoming message
+    // Store current recipient state
+    RecipientType orig_type = _recipient_type;
+    int orig_index = _recipient_index;
+    
+    if (is_channel_msg) {
+      // Add message to channel conversation (channel 0 = Public)
+      int channel_conv_idx = findOrCreateConversation(RECIPIENT_CHANNEL, 0);
+      Conversation* conv = &_conversations[channel_conv_idx];
+      
+      // Add message directly to the channel conversation
+      if (conv->num_messages >= MAX_CHAT_MESSAGES) {
+        for (int i = 0; i < MAX_CHAT_MESSAGES - 1; i++) {
+          conv->messages[i] = conv->messages[i + 1];
+        }
+        conv->num_messages = MAX_CHAT_MESSAGES - 1;
+      }
+      
+      ChatMessage* msg = &conv->messages[conv->num_messages];
+      strncpy(msg->sender_id, sender_id, sizeof(msg->sender_id) - 1);
+      msg->sender_id[sizeof(msg->sender_id) - 1] = 0;
+      strncpy(msg->text, clean_text, sizeof(msg->text) - 1);
+      msg->text[sizeof(msg->text) - 1] = 0;
+      msg->timestamp = rtc_clock.getCurrentTime();
+      msg->is_outgoing = false;
+      msg->sent_indicator_until = 0;
+      conv->num_messages++;
+      
+      // Switch to channel view to show the new message
+      _recipient_type = RECIPIENT_CHANNEL;
+      _recipient_index = 0;
+      switchConversation(_recipient_type, _recipient_index);
+    } else {
+      // For DM: Add sender to recent senders
+      addRecentSender(from_name);
+      
+      // Add message to the DM conversation (sender will be at index 0 after addRecentSender)
+      int dm_conv_idx = findOrCreateConversation(RECIPIENT_CONTACT, 0);
+      Conversation* conv = &_conversations[dm_conv_idx];
+      
+      // Add message directly to the DM conversation
+      if (conv->num_messages >= MAX_CHAT_MESSAGES) {
+        for (int i = 0; i < MAX_CHAT_MESSAGES - 1; i++) {
+          conv->messages[i] = conv->messages[i + 1];
+        }
+        conv->num_messages = MAX_CHAT_MESSAGES - 1;
+      }
+      
+      ChatMessage* msg = &conv->messages[conv->num_messages];
+      strncpy(msg->sender_id, sender_id, sizeof(msg->sender_id) - 1);
+      msg->sender_id[sizeof(msg->sender_id) - 1] = 0;
+      strncpy(msg->text, clean_text, sizeof(msg->text) - 1);
+      msg->text[sizeof(msg->text) - 1] = 0;
+      msg->timestamp = rtc_clock.getCurrentTime();
+      msg->is_outgoing = false;
+      msg->sent_indicator_until = 0;
+      conv->num_messages++;
+      
+      // Switch to DM view with this sender
+      _recipient_type = RECIPIENT_CONTACT;
+      _recipient_index = 0;
+      switchConversation(_recipient_type, _recipient_index);
+    }
+    
     _dirty = true;
   }
 
@@ -920,19 +1247,58 @@ public:
     display.setCursor(display.width() - display.getTextWidth(cnt) - 1, 0);
     display.print(cnt);
 
-    // Chat history area (most of the screen)
-    int chat_start_y = 12;
-    int compose_start_y = display.height() - 20;
-    int chat_height = compose_start_y - chat_start_y - 2;
+    // Divider below header
+    display.drawRect(0, 10, display.width(), 1);
+
+    // Chat area fills most of the screen
+    int chat_start_y = 14;
+    int line_height = 10;
+    int chat_bottom_y = display.height() - 2;
     
-    // Display chat messages
+    // Calculate how many lines the current compose message needs
+    int compose_lines = 0;
+    if (_len > 0) {
+      int prefix_width = display.getTextWidth("You: ");
+      int available_width = display.width() - prefix_width;
+      int chars_per_line = available_width / 6; // Rough estimate: 6 pixels per char
+      if (chars_per_line > 0) {
+        compose_lines = (_len + chars_per_line - 1) / chars_per_line; // Ceiling division
+        if (compose_lines < 1) compose_lines = 1;
+      } else {
+        compose_lines = 1;
+      }
+    }
+    
+    // Get current conversation messages
+    int num_messages = 0;
+    ChatMessage* messages = nullptr;
+    if (_current_conversation_idx >= 0 && _current_conversation_idx < _num_conversations) {
+      Conversation* conv = &_conversations[_current_conversation_idx];
+      num_messages = conv->num_messages;
+      messages = conv->messages;
+    }
+    
+    // Calculate total content (chat history + compose lines)
+    int total_content_lines = num_messages + compose_lines;
+    int available_lines = (chat_bottom_y - chat_start_y) / line_height;
+    
+    // Calculate which chat messages to show (scroll from bottom if needed)
+    int chat_start_idx = 0;
+    if (total_content_lines > available_lines) {
+      int lines_to_skip = total_content_lines - available_lines;
+      chat_start_idx = lines_to_skip;
+      if (chat_start_idx > num_messages) {
+        chat_start_idx = num_messages;
+      }
+    }
+    
+    // Display chat messages that fit above compose area
     display.setColor(DisplayDriver::LIGHT);
     int y = chat_start_y;
-    int messages_to_show = chat_height / 10; // ~10 pixels per message line
-    int start_idx = _num_chat_messages > messages_to_show ? _num_chat_messages - messages_to_show : 0;
+    int max_chat_lines = available_lines - compose_lines;
     
-    for (int i = start_idx; i < _num_chat_messages && y < compose_start_y - 10; i++) {
-      ChatMessage* msg = &_chat_history[i];
+    for (int i = chat_start_idx; i < num_messages && (i - chat_start_idx) < max_chat_lines; i++) {
+      ChatMessage* msg = &messages[i];
       display.setCursor(0, y);
       
       if (msg->is_outgoing) {
@@ -945,7 +1311,7 @@ public:
       }
       
       display.setColor(DisplayDriver::LIGHT);
-      // Calculate prefix width and truncate message if needed
+      // Calculate prefix width and check for [SENT] indicator
       char prefix[8];
       if (msg->is_outgoing) {
         strcpy(prefix, "You: ");
@@ -953,7 +1319,11 @@ public:
         snprintf(prefix, sizeof(prefix), "%s: ", msg->sender_id);
       }
       int prefix_width = display.getTextWidth(prefix);
-      int remaining_width = display.width() - prefix_width;
+      
+      // Check if we should show [SENT] indicator
+      bool show_sent_indicator = msg->is_outgoing && (millis() < msg->sent_indicator_until);
+      int indicator_width = show_sent_indicator ? display.getTextWidth(" [SENT]") : 0;
+      int remaining_width = display.width() - prefix_width - indicator_width;
       
       // Truncate message text to fit remaining width
       char truncated[60];
@@ -971,70 +1341,100 @@ public:
       
       display.print(truncated);
       
-      y += 10;
+      // Show [SENT] indicator if needed
+      if (show_sent_indicator) {
+        display.setColor(DisplayDriver::YELLOW);
+        display.print(" [SENT]");
+        display.setColor(DisplayDriver::LIGHT);
+      }
+      y += line_height;
     }
 
-    // Divider above compose area
-    display.drawRect(0, compose_start_y - 2, display.width(), 1);
-
-    // Compose area at bottom
-    display.setColor(DisplayDriver::LIGHT);
-    display.setCursor(0, compose_start_y);
-    char show[MAX_LEN + 1];
-    memcpy(show, _buf, _len);
-    show[_len] = 0;
-    
-    // Show only what fits in the compose area
-    int compose_width = display.width();
-    display.print(show); // Simple display for now, could add word wrap if needed
+    // Compose line(s) - positioned as continuation of chat flow
+    if (_len > 0) {
+      char show[MAX_LEN + 1];
+      memcpy(show, _buf, _len);
+      show[_len] = 0;
+      
+      int prefix_width = display.getTextWidth("You: ");
+      int available_width = display.width() - prefix_width;
+      int chars_per_line = available_width / 6; // Rough estimate: 6 pixels per char
+      
+      if (chars_per_line > 0) {
+        // Display compose text with word wrapping, continuing from current y position
+        int char_pos = 0;
+        for (int line = 0; line < compose_lines && char_pos < _len && y <= chat_bottom_y - line_height; line++) {
+          display.setCursor(0, y);
+          
+          // Show "You: " prefix only on first line
+          if (line == 0) {
+            display.setColor(DisplayDriver::GREEN);
+            display.print("You: ");
+          } else {
+            // Indent continuation lines
+            display.setCursor(prefix_width, y);
+          }
+          
+          display.setColor(DisplayDriver::LIGHT);
+          
+          // Extract text for this line
+          int chars_this_line = chars_per_line;
+          if (char_pos + chars_this_line > _len) {
+            chars_this_line = _len - char_pos;
+          }
+          
+          char line_text[chars_per_line + 1];
+          strncpy(line_text, show + char_pos, chars_this_line);
+          line_text[chars_this_line] = 0;
+          
+          display.print(line_text);
+          
+          // Show cursor on the last line if this is the end of text
+          if (char_pos + chars_this_line >= _len && (millis() / 500) % 2) {
+            display.print("_");
+          }
+          
+          char_pos += chars_this_line;
+          y += line_height;
+        }
+      }
+    }
 
     // Footer help removed for cleaner interface
-
-    // Sent popup
-    if (millis() < _sent_popup_until) {
-      display.setColor(DisplayDriver::DARK);
-      int p = display.height() / 32;
-      int y = display.height() / 3;
-      display.fillRect(p, y, display.width() - 2 * p, y);
-      display.setColor(DisplayDriver::LIGHT);
-      display.drawRect(p, y, display.width() - 2 * p, y);
-      display.drawTextCentered(display.width() / 2, y + p * 3, "Sent!");
-      return 600;  // refresh during popup
+    
+    // Check if any messages in current conversation have active [SENT] indicators
+    bool has_active_indicator = false;
+    if (messages) {
+      for (int i = 0; i < num_messages; i++) {
+        if (messages[i].is_outgoing && millis() < messages[i].sent_indicator_until) {
+          has_active_indicator = true;
+          break;
+        }
+      }
     }
 
 #if AUTO_OFF_MILLIS==0
-    return 2000;
+    return has_active_indicator ? 100 : 2000;
 #else
-    return _dirty ? 100 : 1500;
+    return (_dirty || has_active_indicator) ? 100 : 1500;
 #endif
   }
 
   bool handleInput(char c) override {
-    // Text navigation keys (only when editing message)
-    if (_len > 0 && c == KEY_LEFT)  { moveLeft();  return true; }
-    if (_len > 0 && c == KEY_RIGHT) { moveRight(); return true; }
-    
-    // Recipient navigation keys (when not editing or message is empty)
-    if (_len == 0 && c == KEY_LEFT) {
-      prevRecipient();
+    // LEFT/RIGHT for screen navigation
+    if (c == KEY_LEFT) {
+      _task->gotoPrevScreen();
       return true;
     }
-    if (_len == 0 && c == KEY_RIGHT) {
-      nextRecipient();
+    if (c == KEY_RIGHT) {
+      _task->gotoNextScreen();
       return true;
     }
 
-    // Up/Down for recipient navigation regardless of message length
+    // UP/DOWN for recipient navigation
     if (c == KEY_PREV) {
-      // If message is empty, this acts as recipient navigation
-      if (_len == 0) {
-        prevRecipient();
-        return true;
-      } else {
-        // If message exists, go back to home
-        _task->gotoHomeScreen();
-        return true;
-      }
+      prevRecipient();
+      return true;
     }
     
     if (c == KEY_NEXT) {
@@ -1055,7 +1455,7 @@ public:
           // Add our sent message to chat history
           addChatMessage("You", _buf, true); // true = outgoing message
           
-          _sent_popup_until = millis() + 800;
+          // Clear the compose buffer without popup
           _len = 0; _cursor = 0; _buf[0] = '\0';
           _dirty = true;
           _task->notify(UIEventType::ack);
@@ -1082,6 +1482,40 @@ public:
 
 
 void UITask::gotoComposeScreen() { setCurrScreen(compose); }
+
+void UITask::gotoPrevScreen() {
+  if (curr == compose) {
+    setCurrScreen(home);
+  } else if (curr == home) {
+    if (_msgcount > 0) {
+      setCurrScreen(msg_preview);
+    } else {
+      setCurrScreen(compose);
+    }
+  } else if (curr == msg_preview) {
+    setCurrScreen(compose);
+  } else {
+    // Default fallback
+    setCurrScreen(home);
+  }
+}
+
+void UITask::gotoNextScreen() {
+  if (curr == compose) {
+    if (_msgcount > 0) {
+      setCurrScreen(msg_preview);
+    } else {
+      setCurrScreen(home);
+    }
+  } else if (curr == home) {
+    setCurrScreen(compose);
+  } else if (curr == msg_preview) {
+    setCurrScreen(home);
+  } else {
+    // Default fallback
+    setCurrScreen(compose);
+  }
+}
 
 
 void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* node_prefs) {
@@ -1169,22 +1603,9 @@ void UITask::msgRead(int msgcount) {
 }
 
 void UITask::newMsg(uint8_t path_len, const char* from_name, const char* text, int msgcount) {
-  // Determine if this is a channel message by checking if from_name matches any channel name
-  bool is_channel_msg = false;
-  
-  for (int i = 0; i < 8; i++) { // Check first 8 channels
-    ChannelDetails channel;
-    if (the_mesh.getChannel(i, channel)) {
-      if (strcmp(from_name, channel.name) == 0) {
-        is_channel_msg = true;
-        break;
-      }
-    } else {
-      break; // No more channels
-    }
-  }
-  
-  if (is_channel_msg) {
+  // Simple heuristic: if from_name is "Public" it's likely a channel, otherwise treat as DM
+  // This avoids complex mesh lookups that might block
+  if (strcmp(from_name, "Public") == 0) {
     newChannelMessage(from_name, text, msgcount);
   } else {
     newDirectMessage(from_name, text, msgcount);
@@ -1516,11 +1937,9 @@ bool UITask::sendTextToRecipient(const char* text, int recipient_type, int recip
         int result = the_mesh.sendMessage(*mesh_contact, timestamp, 0, text, expected_ack, est_timeout);
         
         if (result == MSG_SEND_SENT_FLOOD) {
-          showAlert("Sent (flood)", 800);
           notify(UIEventType::ack);
           return true;
         } else if (result == MSG_SEND_SENT_DIRECT) {
-          showAlert("Sent (direct)", 800);
           notify(UIEventType::ack);
           return true;
         }
@@ -1537,11 +1956,9 @@ bool UITask::sendTextToRecipient(const char* text, int recipient_type, int recip
           int result = the_mesh.sendMessage(*mesh_contact, timestamp, 0, text, expected_ack, est_timeout);
           
           if (result == MSG_SEND_SENT_FLOOD) {
-            showAlert("Sent (flood)", 800);
             notify(UIEventType::ack);
             return true;
           } else if (result == MSG_SEND_SENT_DIRECT) {
-            showAlert("Sent (direct)", 800);
             notify(UIEventType::ack);
             return true;
           }
@@ -1557,9 +1974,6 @@ bool UITask::sendTextToRecipient(const char* text, int recipient_type, int recip
     ChannelDetails channel;
     if (the_mesh.getChannel(recipient_index, channel)) {
       if (the_mesh.sendGroupMessage(timestamp, channel.channel, the_mesh.getNodeName(), text, msg_len)) {
-        char alert_msg[32];
-        snprintf(alert_msg, sizeof(alert_msg), "Sent to #%s", channel.name[0] ? channel.name : "Channel");
-        showAlert(alert_msg, 800);
         notify(UIEventType::ack);
         return true;
       } else {
@@ -1579,7 +1993,6 @@ bool UITask::sendTextToRecipient(const char* text, int recipient_type, int recip
     ChannelDetails channel;
     if (the_mesh.getChannel(0, channel)) {
       if (the_mesh.sendGroupMessage(timestamp, channel.channel, the_mesh.getNodeName(), text, msg_len)) {
-        showAlert("Broadcast sent", 800);
         notify(UIEventType::ack);
         return true;
       }
