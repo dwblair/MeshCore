@@ -558,7 +558,7 @@ class ComposeScreen : public UIScreen {
     bool is_outgoing;   // true if sent by us, false if received
     uint32_t sent_indicator_until; // timestamp until which to show [SENT]
   };
-  static constexpr int MAX_CHAT_MESSAGES = 8;  // Maximum messages per conversation (older messages auto-deleted)
+  static constexpr int MAX_CHAT_MESSAGES = 8;
   static constexpr int MAX_CONVERSATIONS = 16;
   
   // Conversation identifier
@@ -585,14 +585,9 @@ class ComposeScreen : public UIScreen {
   Conversation _conversations[MAX_CONVERSATIONS];
   int _num_conversations = 0;
   int _current_conversation_idx = -1;
-  int _message_scroll_offset = 0;  // For scrolling through messages with UP/DOWN
 
   void insertChar(char ch) {
-    if (_len >= MAX_LEN) {
-      // Show popup when character limit is reached
-      _task->showAlert("message limit 240 char", 1500);
-      return;
-    }
+    if (_len >= MAX_LEN) return;
     // shift right from cursor
     for (int i = _len; i >= _cursor; --i) _buf[i + 1] = _buf[i];
     _buf[_cursor] = ch;
@@ -709,7 +704,6 @@ class ComposeScreen : public UIScreen {
   // Switch to a different conversation when recipient changes
   void switchConversation(RecipientType type, int index) {
     _current_conversation_idx = findOrCreateConversation(type, index);
-    _message_scroll_offset = 0;  // Reset scroll when switching conversations
     _dirty = true;
   }
 
@@ -742,7 +736,7 @@ class ComposeScreen : public UIScreen {
     pub->index = 0;
     strcpy(pub->name, "Public");
     
-    // Add channels with active conversations only
+    // Add channels with active conversations
     for (int i = 1; i < 32; i++) { // Skip channel 0 (already added)
       ChannelDetails channel;
       if (the_mesh.getChannel(i, channel)) {
@@ -993,26 +987,6 @@ class ComposeScreen : public UIScreen {
     _dirty = true;
   }
 
-  // Helper function to find channel index by name
-  int findChannelIndexByName(const char* channel_name) {
-    if (!channel_name) return 0; // Default to Public
-    
-    // Check channels 0-31 (typical range)
-    for (int i = 0; i < 32; i++) {
-      ChannelDetails channel;
-      if (the_mesh.getChannel(i, channel)) {
-        if (strcmp(channel.name, channel_name) == 0) {
-          return i;
-        }
-      } else {
-        break; // No more channels
-      }
-    }
-    
-    // If not found, return 0 (Public channel as fallback)
-    return 0;
-  }
-
   void formatContactId(char* dest, int max_len, const uint8_t* pubkey_prefix) {
     // Check if the pubkey is all zeros
     bool all_zeros = true;
@@ -1033,18 +1007,17 @@ class ComposeScreen : public UIScreen {
   }
 
   void getCurrentRecipientName(char* dest, int max_len) {
-    // Use filtered recipient name if available (without "To:" prefix)
+    // Use filtered recipient name if available
     if (_current_filtered_index >= 0 && _current_filtered_index < _num_filtered_recipients) {
-      strncpy(dest, _filtered_recipients[_current_filtered_index].name, max_len - 1);
-      dest[max_len - 1] = 0;
+      snprintf(dest, max_len, "To: %s", _filtered_recipients[_current_filtered_index].name);
     } else {
-      // Fallback to original logic (without "To:" prefix)
+      // Fallback to original logic
       if (_recipient_type == RECIPIENT_CONTACT) {
-        snprintf(dest, max_len, "Contact%d", _recipient_index);
+        snprintf(dest, max_len, "To: Contact%d", _recipient_index);
       } else if (_recipient_type == RECIPIENT_CHANNEL) {
-        snprintf(dest, max_len, "Ch%d", _recipient_index);
+        snprintf(dest, max_len, "To: Ch%d", _recipient_index);
       } else {
-        strcpy(dest, "Broadcast");
+        strcpy(dest, "To: Broadcast");
       }
     }
   }
@@ -1198,10 +1171,8 @@ public:
     int orig_index = _recipient_index;
     
     if (is_channel_msg) {
-      // Find the correct channel index based on the channel name
-      int channel_index = findChannelIndexByName(from_name);
-      // Add message to the correct channel conversation
-      int channel_conv_idx = findOrCreateConversation(RECIPIENT_CHANNEL, channel_index);
+      // Add message to channel conversation (channel 0 = Public)
+      int channel_conv_idx = findOrCreateConversation(RECIPIENT_CHANNEL, 0);
       Conversation* conv = &_conversations[channel_conv_idx];
       
       // Add message directly to the channel conversation
@@ -1222,16 +1193,10 @@ public:
       msg->sent_indicator_until = 0;
       conv->num_messages++;
       
-      // Don't auto-switch channels - let user stay on current conversation
-      // The message is now properly stored in the correct channel conversation
-      
-      // If this message was added to the currently visible conversation, auto-scroll to bottom
-      if (_current_conversation_idx == channel_conv_idx) {
-        _message_scroll_offset = 0; // Reset to show most recent messages
-      }
-      
-      // Rebuild recipient list to ensure new channels are available for navigation
-      buildFilteredRecipientList();
+      // Switch to channel view to show the new message
+      _recipient_type = RECIPIENT_CHANNEL;
+      _recipient_index = 0;
+      switchConversation(_recipient_type, _recipient_index);
     } else {
       // For DM: Add sender to recent senders
       addRecentSender(from_name);
@@ -1258,24 +1223,17 @@ public:
       msg->sent_indicator_until = 0;
       conv->num_messages++;
       
-      // If this message was added to the currently visible conversation, auto-scroll to bottom
-      if (_current_conversation_idx == dm_conv_idx) {
-        _message_scroll_offset = 0; // Reset to show most recent messages
-      }
-      
-      // Switch to DM view with this sender (only if not already viewing a conversation)
-      if (_current_conversation_idx < 0) {
-        _recipient_type = RECIPIENT_CONTACT;
-        _recipient_index = 0;
-        switchConversation(_recipient_type, _recipient_index);
-      }
+      // Switch to DM view with this sender
+      _recipient_type = RECIPIENT_CONTACT;
+      _recipient_index = 0;
+      switchConversation(_recipient_type, _recipient_index);
     }
     
     _dirty = true;
   }
 
   int render(DisplayDriver& display) override {
-    // Header with recipient name 
+    // Header with recipient name and char count
     char recipient_name[32];
     getCurrentRecipientName(recipient_name, sizeof(recipient_name));
     display.setColor(DisplayDriver::YELLOW);
@@ -1283,6 +1241,11 @@ public:
     display.setCursor(0, 0);
     display.print(recipient_name);
 
+    // Counter on same line
+    char cnt[16];
+    sprintf(cnt, " %d/%d", _len, MAX_LEN);
+    display.setCursor(display.width() - display.getTextWidth(cnt) - 1, 0);
+    display.print(cnt);
 
     // Divider below header
     display.drawRect(0, 10, display.width(), 1);
@@ -1319,98 +1282,22 @@ public:
     int total_content_lines = num_messages + compose_lines;
     int available_lines = (chat_bottom_y - chat_start_y) / line_height;
     
-    // Calculate which chat messages to show (accounting for wrapped text lines)
-    int max_chat_lines = available_lines - compose_lines;
+    // Calculate which chat messages to show (scroll from bottom if needed)
     int chat_start_idx = 0;
-    
-    // Helper function to calculate lines needed for a message
-    auto calculateMessageLines = [](ChatMessage* msg, int available_width) -> int {
-      int text_len = strlen(msg->text);
-      int chars_per_line = available_width / 6; // Rough estimate: 6 pixels per char
-      if (chars_per_line < 10) chars_per_line = 10;
-      int lines_needed = (text_len + chars_per_line - 1) / chars_per_line;
-      return lines_needed < 1 ? 1 : lines_needed;
-    };
-    
-    // Calculate total lines needed for all messages
-    int total_message_lines = 0;
-    for (int i = 0; i < num_messages; i++) {
-      ChatMessage* msg = &messages[i];
-      // Use average available width for calculation (rough estimate)
-      int avg_available_width = display.width() - 30; // Account for "You: " or "5D3: " prefix
-      total_message_lines += calculateMessageLines(msg, avg_available_width);
-    }
-    
-    // Messages are stored with index 0 = oldest, index (num_messages-1) = newest
-    // Scroll offset 0 = show newest messages, higher offset = show older messages
-    
-    if (_message_scroll_offset == 0) {
-      // Default view: auto-position so most recent messages fit at bottom
-      if (total_message_lines > max_chat_lines) {
-        // Work backwards from the most recent message to find what fits
-        int lines_used = 0;
+    if (total_content_lines > available_lines) {
+      int lines_to_skip = total_content_lines - available_lines;
+      chat_start_idx = lines_to_skip;
+      if (chat_start_idx > num_messages) {
         chat_start_idx = num_messages;
-        
-        for (int i = num_messages - 1; i >= 0; i--) {
-          ChatMessage* msg = &messages[i];
-          int avg_available_width = display.width() - 30;
-          int msg_lines = calculateMessageLines(msg, avg_available_width);
-          
-          if (lines_used + msg_lines <= max_chat_lines) {
-            lines_used += msg_lines;
-            chat_start_idx = i;
-          } else {
-            break;
-          }
-        }
-      } else {
-        // All messages fit - start from beginning (oldest)
-        chat_start_idx = 0;
-      }
-    } else {
-      // Manual scroll: Calculate base position from auto-view and scroll from there
-      int auto_start = 0;
-      
-      // First find where auto-positioning would start
-      if (total_message_lines > max_chat_lines) {
-        int lines_used = 0;
-        auto_start = num_messages;
-        
-        for (int i = num_messages - 1; i >= 0; i--) {
-          ChatMessage* msg = &messages[i];
-          int avg_available_width = display.width() - 30;
-          int msg_lines = calculateMessageLines(msg, avg_available_width);
-          
-          if (lines_used + msg_lines <= max_chat_lines) {
-            lines_used += msg_lines;
-            auto_start = i;
-          } else {
-            break;
-          }
-        }
-      } else {
-        // All messages fit, auto-view starts from beginning
-        auto_start = 0;
-      }
-      
-      // Now scroll back from auto-start position
-      chat_start_idx = auto_start - _message_scroll_offset;
-      
-      // Bounds checking
-      if (chat_start_idx < 0) {
-        chat_start_idx = 0; // Don't go before oldest message
-      }
-      if (chat_start_idx >= num_messages) {
-        chat_start_idx = num_messages > 0 ? num_messages - 1 : 0;
       }
     }
     
     // Display chat messages that fit above compose area
     display.setColor(DisplayDriver::LIGHT);
     int y = chat_start_y;
+    int max_chat_lines = available_lines - compose_lines;
     
-    int lines_used = 0;
-    for (int i = chat_start_idx; i < num_messages && lines_used < max_chat_lines; i++) {
+    for (int i = chat_start_idx; i < num_messages && (i - chat_start_idx) < max_chat_lines; i++) {
       ChatMessage* msg = &messages[i];
       display.setCursor(0, y);
       
@@ -1424,8 +1311,7 @@ public:
       }
       
       display.setColor(DisplayDriver::LIGHT);
-      
-      // Calculate prefix width for word wrapping
+      // Calculate prefix width and check for [SENT] indicator
       char prefix[8];
       if (msg->is_outgoing) {
         strcpy(prefix, "You: ");
@@ -1437,46 +1323,31 @@ public:
       // Check if we should show [SENT] indicator
       bool show_sent_indicator = msg->is_outgoing && (millis() < msg->sent_indicator_until);
       int indicator_width = show_sent_indicator ? display.getTextWidth(" [SENT]") : 0;
-      int available_width = display.width() - prefix_width - indicator_width;
+      int remaining_width = display.width() - prefix_width - indicator_width;
       
-      // Use simple word wrapping with display's built-in printWordWrap
-      char filtered_text[80];
+      // Truncate message text to fit remaining width
+      char truncated[60];
+      strncpy(truncated, msg->text, sizeof(truncated) - 1);
+      truncated[sizeof(truncated) - 1] = 0;
       
-      // Simple safe text copy without UTF-8 filtering to avoid character corruption
-      strncpy(filtered_text, msg->text, sizeof(filtered_text) - 1);
-      filtered_text[sizeof(filtered_text) - 1] = 0;
-      
-      // Filter out any non-printable characters manually
-      for (int j = 0; filtered_text[j]; j++) {
-        if (filtered_text[j] < 32 || filtered_text[j] > 126) {
-          filtered_text[j] = '?'; // Replace non-printable with ?
+      // Simple truncation - could be improved with proper text measurement
+      if (strlen(truncated) * 6 > remaining_width) { // Rough estimate: 6 pixels per char
+        int max_chars = remaining_width / 6 - 3; // Leave space for "..."
+        if (max_chars > 0 && max_chars < sizeof(truncated)) {
+          truncated[max_chars] = 0;
+          strcat(truncated, "...");
         }
       }
       
-      display.printWordWrap(filtered_text, available_width);
+      display.print(truncated);
       
-      // Show [SENT] indicator if needed (position it after the wrapped text)
+      // Show [SENT] indicator if needed
       if (show_sent_indicator) {
         display.setColor(DisplayDriver::YELLOW);
         display.print(" [SENT]");
         display.setColor(DisplayDriver::LIGHT);
       }
-      
-      // Estimate lines needed more conservatively
-      int text_len = strlen(filtered_text);
-      int chars_per_line = available_width / 6; // Rough estimate: 6 pixels per char
-      if (chars_per_line < 10) chars_per_line = 10;
-      int lines_needed = (text_len + chars_per_line - 1) / chars_per_line;
-      if (lines_needed < 1) lines_needed = 1;
-      
-      // Account for the space printWordWrap actually used plus a gap
-      // For wrapped messages, we need more vertical space
-      if (lines_needed > 1) {
-        y += line_height * lines_needed + 1; // Full estimated height plus small gap
-      } else {
-        y += line_height + 1; // Normal single line plus small gap
-      }
-      lines_used += lines_needed;
+      y += line_height;
     }
 
     // Compose line(s) - positioned as continuation of chat flow
@@ -1550,95 +1421,24 @@ public:
   }
 
   bool handleInput(char c) override {
-    // LEFT/RIGHT for channel/DM navigation with screen wraparound
+    // LEFT/RIGHT for screen navigation
     if (c == KEY_LEFT) {
-      // Try to go to previous recipient
-      if (_current_filtered_index > 0) {
-        prevRecipient();
-      } else {
-        // At first recipient, go to previous screen
-        _task->gotoPrevScreen();
-      }
+      _task->gotoPrevScreen();
       return true;
     }
     if (c == KEY_RIGHT) {
-      // Try to go to next recipient
-      if (_current_filtered_index < _num_filtered_recipients - 1) {
-        nextRecipient();
-      } else {
-        // At last recipient, go to next screen
-        _task->gotoNextScreen();
-      }
+      _task->gotoNextScreen();
       return true;
     }
 
-    // UP/DOWN for message navigation within current conversation
-    // Note: Only MAX_CHAT_MESSAGES are kept in memory - older messages are automatically deleted
+    // UP/DOWN for recipient navigation
     if (c == KEY_PREV) {
-      // UP arrow: Push newest messages down off screen, bring older messages from top
-      int num_messages = 0;
-      if (_current_conversation_idx >= 0 && _current_conversation_idx < _num_conversations) {
-        num_messages = _conversations[_current_conversation_idx].num_messages;
-      }
-      
-      // Calculate the actual limit based on how far we can scroll back
-      // Find where auto-positioning would start to determine max useful scroll
-      int auto_start = 0;
-      if (num_messages > 0) {
-        // Calculate total lines and auto-start position (same logic as in render)
-        int total_message_lines = 0;
-        for (int i = 0; i < num_messages; i++) {
-          int avg_available_width = 128 - 30; // Rough estimate
-          int text_len = strlen(_conversations[_current_conversation_idx].messages[i].text);
-          int chars_per_line = avg_available_width / 6;
-          if (chars_per_line < 10) chars_per_line = 10;
-          int lines_needed = (text_len + chars_per_line - 1) / chars_per_line;
-          if (lines_needed < 1) lines_needed = 1;
-          total_message_lines += lines_needed;
-        }
-        
-        int available_lines = (64 - 14 - 2) / 10; // Rough calculation
-        int max_chat_lines = available_lines - 2; // Account for compose area
-        
-        if (total_message_lines > max_chat_lines) {
-          // Find auto-start position
-          int lines_used = 0;
-          auto_start = num_messages;
-          
-          for (int i = num_messages - 1; i >= 0; i--) {
-            int avg_available_width = 128 - 30;
-            int text_len = strlen(_conversations[_current_conversation_idx].messages[i].text);
-            int chars_per_line = avg_available_width / 6;
-            if (chars_per_line < 10) chars_per_line = 10;
-            int lines_needed = (text_len + chars_per_line - 1) / chars_per_line;
-            if (lines_needed < 1) lines_needed = 1;
-            
-            if (lines_used + lines_needed <= max_chat_lines) {
-              lines_used += lines_needed;
-              auto_start = i;
-            } else {
-              break;
-            }
-          }
-        }
-      }
-      
-      // Max scroll is limited by how far back we can go from auto-start
-      int max_scroll = auto_start;
-      
-      if (_message_scroll_offset < max_scroll) {
-        _message_scroll_offset++;
-        _dirty = true;
-      }
+      prevRecipient();
       return true;
     }
     
     if (c == KEY_NEXT) {
-      // DOWN arrow: Pull newest messages back up from bottom, push older messages up off top
-      if (_message_scroll_offset > 0) {
-        _message_scroll_offset--;
-        _dirty = true;
-      }
+      nextRecipient();
       return true;
     }
 
@@ -1654,9 +1454,6 @@ public:
         if (_task->sendTextToRecipient(_buf, _recipient_type, _recipient_index, this)) {
           // Add our sent message to chat history
           addChatMessage("You", _buf, true); // true = outgoing message
-          
-          // Auto-scroll to bottom to show the sent message
-          _message_scroll_offset = 0;
           
           // Clear the compose buffer without popup
           _len = 0; _cursor = 0; _buf[0] = '\0';
@@ -1806,25 +1603,9 @@ void UITask::msgRead(int msgcount) {
 }
 
 void UITask::newMsg(uint8_t path_len, const char* from_name, const char* text, int msgcount) {
-  // Check if this is a channel message (both public and private channels)
-  bool is_channel = false;
-  
+  // Simple heuristic: if from_name is "Public" it's likely a channel, otherwise treat as DM
+  // This avoids complex mesh lookups that might block
   if (strcmp(from_name, "Public") == 0) {
-    // Public channel
-    is_channel = true;
-  } else if (from_name && from_name[0] == '#') {
-    // Private channel (starts with #)
-    is_channel = true;
-  } else if (text && strchr(text, ':')) {
-    // Check if text has the "SenderName : Message" format typical of channels
-    const char* colon_pos = strchr(text, ':');
-    // Look for space before and after colon (typical channel format)
-    if (colon_pos > text && *(colon_pos-1) == ' ' && *(colon_pos+1) == ' ') {
-      is_channel = true;
-    }
-  }
-  
-  if (is_channel) {
     newChannelMessage(from_name, text, msgcount);
   } else {
     newDirectMessage(from_name, text, msgcount);
